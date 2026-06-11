@@ -8,9 +8,16 @@ import os
 from dotenv import load_dotenv
 from urllib.parse import urlencode, urlparse, parse_qs
 from flask import Flask, request, redirect
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import logging
 
 load_dotenv()
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper(), logging.INFO),
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -65,14 +72,14 @@ def oauth_callback():
     response = requests.post(TOKEN_URL, data=data)
 
     if response.status_code != 200:
-        print(f"Error fetching token {response.text}")
+        logger.error("Error fetching token: %s", response.text)
         return f"Error fetching token: {response.text}", 500
 
     token_data = response.json()
     access_token = token_data.get('access_token')
 
     if not access_token:
-        print(f"Error: No access token received")
+        logger.error("No access token received")
         return "Error: No access token received", 500
 
     # Use the access token to get user info
@@ -80,35 +87,36 @@ def oauth_callback():
     user_info_response = requests.get(os.getenv('USER_API_URL'), headers={'Authorization': f'Bearer {access_token}'})
 
     if user_info_response.status_code !=200:
-        print(f"Error fetching user info: {user_info_response.text}")
+        logger.error("Error fetching user info: %s", user_info_response.text)
         return f"Error fetching user info: {user_info_response.text}", 500
 
     user_info = user_info_response.json()
-    print(state)
-    print(user_info)
+    logger.debug("OAuth callback state: %s", state)
+    logger.debug("User info from portal: %s", user_info)
     if user_info['membershipType'] in {"Full","Trial"}:
-        print(f"Valid membership")
+        logger.debug("Valid membership for state %s", state)
     else:
-        print(f"Invalid membership, you must have a Trial or Full membership")
+        logger.warning("Invalid membership type for state %s", state)
         return f"Invalid membership, you must have a Trial or Full membership", 400
     if(is_membership_expired(user_info['membershipExpiration'])):
-        print(f"Membership expired {user_info['membershipNumber']} {user_info['membershipExpiration']}")
+        logger.debug("Membership expired: %s exp %s", user_info['membershipNumber'], user_info['membershipExpiration'])
         return f"Membership expired. Please renew your membership and try again.", 400
     MAX_RETRIES = 5
     DELAY_SECONDS = 0.2
     try:
         cursor=get_cursor()
     except mysql.connector.Error as e:
-        print(f"DB unavailable in oauth_callback: {e}")
+        logger.error("DB unavailable in oauth_callback: %s", e)
         return "Service temporarily unavailable", 503
-    cursor.execute("SELECT user_id FROM user_states")
-    print(f"{cursor.fetchall()}")
     for attempt in range(MAX_RETRIES):
-        cursor.execute("SELECT user_id FROM user_states WHERE state = %s", (state,))
-        print(f"SELECT user_id FROM user_states WHERE state = '{state}'")
+        cursor.execute(
+            "SELECT user_id FROM user_states WHERE state = %s AND timestamp > %s",
+            (state, datetime.now(timezone.utc) - timedelta(minutes=15))
+        )
+        logger.debug("Looking up state in user_states")
         result = cursor.fetchone()
         cursor.fetchall()
-        print(result)
+        logger.debug("State lookup result found: %s", result is not None)
         if result: #if we find it, then stop here
             break
         if attempt < MAX_RETRIES - 1:
@@ -121,6 +129,7 @@ def oauth_callback():
             "ON DUPLICATE KEY UPDATE last_authorized = CURRENT_TIMESTAMP",
             (user_id, user_info['membershipNumber'])
     )
+    cursor.execute("DELETE FROM user_states WHERE state = %s", (state,))
     cnx.commit()
     cursor.close()
     return f"Success", 200
@@ -135,7 +144,7 @@ def oauth_authorize():
     CLIENT_ID=os.getenv('CLIENT_ID')
     REDIRECT_URI=os.getenv('REDIRECT_URI')
     auth_url = f"{AUTHORIZE_URL}?{urlencode({'client_id': CLIENT_ID, 'redirect_uri': REDIRECT_URI, 'response_type': 'code', 'state': state})}"
-    print(auth_url)
+    logger.debug("Redirecting to OAuth provider for state %s", state)
     return redirect(auth_url)
 
 
@@ -145,11 +154,11 @@ try:
                                 database=os.getenv('DB_DATABASE'))
 except mysql.connector.Error as err:
   if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-    print("Something is wrong with your user name or password")
+    logger.critical("DB auth failed: bad credentials")
   elif err.errno == errorcode.ER_BAD_DB_ERROR:
-    print("Database does not exist")
+    logger.critical("DB auth failed: database not found")
   else:
-    print(err)
+    logger.critical("DB connection error: %s", err)
 
 #cursor=cnx.cursor()
 
