@@ -14,6 +14,26 @@ load_dotenv()
 
 app = Flask(__name__)
 
+
+def get_cursor():
+    """Return a DB cursor, reconnecting the global connection if it went stale.
+
+    Tries ping/reconnect first; falls back to a fresh connection. Raises
+    mysql.connector.Error if the DB cannot be reached after all attempts.
+    """
+    global cnx
+    try:
+        cnx.ping(reconnect=True, attempts=3, delay=2)
+    except mysql.connector.Error:
+        cnx = mysql.connector.connect(
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            host=os.getenv('DB_SERVER'),
+            database=os.getenv('DB_DATABASE')
+        )
+    return cnx.cursor()
+
+
 def is_membership_expired(membership_expiration: str) -> bool:
     expiration_date = datetime.strptime(membership_expiration, "%Y-%m-%d")
     current_date = datetime.today()
@@ -77,17 +97,15 @@ def oauth_callback():
     MAX_RETRIES = 5
     DELAY_SECONDS = 0.2
     try:
-        cursor=cnx.cursor()
-    except Exception as e:
-        print(f"Error: {e}")
-        print(f"Exiting due to error")
-        os._exit(1)
-        return f"Unable to connect to database", 500
+        cursor=get_cursor()
+    except mysql.connector.Error as e:
+        print(f"DB unavailable in oauth_callback: {e}")
+        return "Service temporarily unavailable", 503
     cursor.execute("SELECT user_id FROM user_states")
     print(f"{cursor.fetchall()}")
     for attempt in range(MAX_RETRIES):
         cursor.execute("SELECT user_id FROM user_states WHERE state = %s", (state,))
-        print(f"SELECT user_id FROM user_states WHERE state = '{state}'") 
+        print(f"SELECT user_id FROM user_states WHERE state = '{state}'")
         result = cursor.fetchone()
         cursor.fetchall()
         print(result)
