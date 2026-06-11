@@ -432,7 +432,9 @@ class MyClient(discord.Client):
                     SELECT DISTINCT ua.discord_user_id
                     FROM user_authorizations ua
                     JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
+                    JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
                     WHERE ea.event_id = %s
+                      AND u.membershipExpiration >= CURDATE()
                 """, (event_id,))
                 attendee_ids = [row[0] for row in cursor.fetchall()]
                 cursor.close()
@@ -912,7 +914,9 @@ class MyClient(discord.Client):
             SELECT 1
             FROM user_authorizations ua
             JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
+            JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
             WHERE ua.discord_user_id = %s AND ea.event_id = %s
+              AND u.membershipExpiration >= CURDATE()
             LIMIT 1
         """, (member.id, event_id))
         is_attendee = cursor.fetchone()
