@@ -1,0 +1,789 @@
+#!/usr/bin/python3
+
+import time
+import asyncio
+from discord.ext import tasks
+import uuid
+import datetime
+import requests
+import mysql.connector
+from mysql.connector import errorcode
+import os
+from dotenv import load_dotenv
+import discord
+from urllib.parse import urlencode, urlparse, parse_qs
+from flask import Flask, request, redirect
+
+load_dotenv()
+
+
+def get_cursor():
+    """Return a DB cursor, reconnecting the global connection if it went stale.
+
+    Tries ping/reconnect first; falls back to a fresh connection. Raises
+    mysql.connector.Error if the DB cannot be reached after all attempts.
+    """
+    global cnx
+    try:
+        cnx.ping(reconnect=True, attempts=3, delay=2)
+    except mysql.connector.Error:
+        cnx = mysql.connector.connect(
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            host=os.getenv('DB_SERVER'),
+            database=os.getenv('DB_DATABASE')
+        )
+    return cnx.cursor()
+
+
+class MyClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.check_user_states_task = None  # Store the task reference
+
+    async def setup_hook(self):
+        """ Ensures tasks are started after the bot is ready """
+        if not self.check_user_states.is_running():
+            self.check_user_states.start()  # Start the background loop safely
+            print("✅ check_user_states loop started!")
+        if not self.daily_task.is_running():
+            self.daily_task.start()
+            print("✅ daily_task loop started!")
+        await super().setup_hook()
+
+    @tasks.loop(hours=1) # run every hour
+    async def daily_task(self):
+        await self.wait_until_ready()  # Waits until the bot is connected
+        try:
+            # check the banlist
+            cursor=get_cursor()
+            cursor.execute("SELECT user_id FROM banned_users")
+            banned_users = [row[0] for row in cursor.fetchall()]
+            print(f"Checking bans for {len(banned_users)} users across all servers.")
+            for guild in self.guilds:
+                #print(f"Checking guild {guild.name}")
+                for user_id in banned_users:
+                    try:
+                        ban_entry = await guild.fetch_ban(discord.Object(id=user_id)) # fetch a banlist if the user is banned
+                        #print(f"✅ User {user_id} is already banned in {guild.name}")
+                    except discord.errors.Forbidden:
+                        #print(f"Missing permission to manage bans in {guild.name}")
+                        pass
+                    except discord.NotFound:
+                        try:
+                            await guild.ban(discord.Object(id=user_id), reason="User is on global ban list")
+                            await self.log_message(guild.id, f"🚨 Banned user {user_id}")
+                            print(f"🚨 Banned user {user_id} in {guild.name}")
+                        except discord.Forbidden:
+                            await self.log_message(guild.id, f"⚠️ Missing permissions to ban {user_id} from global banlist")
+                            print(f"⚠️ Missing permissions to ban {user_id} in {guild.name}")
+                        except discord.HTTPException as e:
+                            await self.log_message(guild.id, f"❌ Failed to ban {user_id}: {e}")
+                            print(f"❌ Failed to ban {user_id} in {guild.name}: {e}")
+            cursor.close()
+            #clearing users from banlist
+            cursor=get_cursor()
+            cursor.execute("SELECT user_id FROM unbanned_users")
+            unbanned_users = [row[0] for row in cursor.fetchall()]
+            print(f"Checking unbans for {len(unbanned_users)} users across all servers.")
+            for guild in self.guilds:
+                for user_id in unbanned_users:
+                    try:
+                        bans = [ban async for ban in guild.bans()]
+                    except discord.Forbidden:
+                        #print(f"Missing permissions to fetch bans in guild {guild.name}.")
+                        continue
+                    except discord.HTTPException as e:
+                        print(f"Error fetching bans for guild {guild.name}: {e}")
+                        continue
+                    banned_user_ids = {ban_entry.user.id for ban_entry in bans}
+                    for user_id in unbanned_users:
+                        if user_id in banned_user_ids:
+                            try:
+                                user = discord.Object(id=user_id)
+                                await guild.unban(user, reason="User is on unbanned list; removing ban.")
+                                print(f"Unbanned user {user_id} in guild {guild.name}.")
+                            except discord.Forbidden:
+                                print(f"Missing permissions to unban user {user_id} in guild {guild.name}.")
+                            except discord.HTTPException as e:
+                                print(f"Error unbanning {user_id} in guild {guild.name}: {e}")
+            cursor.close()
+
+            # check on membership expiration and notify users in 4 weeks, 2 weeks 1 week and upon expiration.
+            # expired members will lose their assigned role and be directed to the portal
+            cursor=get_cursor()
+            cursor.execute("SELECT last_run_date FROM daily_tasks WHERE task_name = 'daily_maintenance'")
+            result = cursor.fetchone()
+            cursor.fetchall()
+            if result:
+                last_run_date=result[0]
+            print("Checking if we should run daily cleanup")
+            if last_run_date < datetime.date.today():
+                # hasn't been run, so let's run the stuff
+                print(f"Running daily maintenance for {datetime.date.today()}")
+                # first we update the table to this doesn't run again
+                cursor.execute("""
+                    INSERT INTO daily_tasks (task_name, last_run_date)
+                    VALUES ('daily_maintenance', %s)
+                    ON DUPLICATE KEY UPDATE last_run_date = %s
+                """, (datetime.date.today(), datetime.date.today()))
+                cnx.commit()
+                # check for expired users and send them a notification
+                cursor.execute("""
+                    SELECT ua.discord_user_id, ua.access_token, u.membershipExpiration
+                    FROM user_authorizations ua
+                    JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
+                """)
+                users = cursor.fetchall()
+                today = datetime.datetime.today().date()
+                notify_days = [28,14,7,0] # notify at 4 weeks, 2 weeks, 1 week and day of expiration
+                for user in users:
+                    user_id = user[0]
+                    expiration_date = user[2]
+
+                    if expiration_date is None:
+                        print(f"{user} invalid expiration date")
+                        continue
+
+                    days_until_expiration = (expiration_date - today).days
+
+                    print(f"Discord id:{user_id} member id:{user[1]} expiration date:{expiration_date} days left:{days_until_expiration}")
+                    if days_until_expiration in notify_days:
+                        try:
+                            discord_user = await self.fetch_user(user_id)
+                            if discord_user:
+                                await discord_user.send(f"🔔 Your membership will expire on {expiration_date}.")
+                                print(f"Notified user {user_id} about membership expiration on {expiration_date}.")
+                        except:
+                            print(f"Could not send message to user {user_id}.")
+
+                    if days_until_expiration < 0:
+                        # Expired membership: Remove from user_authorizations
+                        cursor.execute("DELETE FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                        cnx.commit()
+                        print(f"Removed expired user {user_id} from user_authorizations.")
+
+                # step 2 check server roles and unauthorized users
+                cursor.execute("SELECT guild_id, role_id FROM server_roles")
+                servers=cursor.fetchall()
+
+                notified_users = set()
+
+                for server in servers:
+                    guild_id = server[0]
+                    role_id = server[1]
+
+                    try:
+                        guild = await self.fetch_guild(guild_id)
+                    except discord.NotFound:
+                        print(f"Guild id {guild_id} not found")
+                        continue
+                    if not guild:
+                        print(f"Guild id {guild_id} not found")
+                        continue
+
+                    role = discord.utils.get(guild.roles, id=role_id)
+                    if not role:
+                        print(f"Role id {role_id} not found")
+                        continue
+
+                    members = [member async for member in guild.fetch_members()]
+                    print(f"Fetched {len(members)} members from {guild.name}")
+
+                    users_with_role = [member.id for member in members if role in member.roles]
+
+                    print(f"Users with {role_id} are {users_with_role}")
+                    for user_id in users_with_role:
+                        if user_id in notified_users:
+                            continue # skip if the user has already been notified
+                        notified_users.add(user_id)
+                        print(f"{user_id}")
+                        discord_user = await self.fetch_user(user_id)
+                        #print(f"Searching for user {discord_user.name} with id {user_id} in authorizations")
+                        cursor.execute("SELECT * FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                        is_authorized = cursor.fetchone()
+                        cursor.fetchall()  # Clear unread results
+
+                        if not is_authorized:
+                            # check if they were notified already
+                            #print(f"User {discord_user.name} with id {user_id} not found in authorizations")
+                            #await self.log_message(guild.id,f"User {discord_user.name} with id {user_id} not found in authorizations")
+                            cursor.execute("SELECT notified_at FROM unauthorized_users WHERE user_id = %s", (user_id,))
+                            existing_entry = cursor.fetchone()
+                            cursor.fetchall() # clear the results
+                            if not existing_entry:
+                                # insert into the table
+                                cursor.execute("""
+                                    INSERT INTO unauthorized_users (user_id, guild_id, notified_at)
+                                    VALUES (%s, %s, NOW())
+                                """, (user_id, guild_id))
+                                cnx.commit()
+                                print(f"Logged unauthorized user {discord_user.name} with id {user_id} in guild {guild.name} to unauthorized users table.")
+                                await self.log_message(guild.id,f"User {discord_user.name} with id {user_id} has role {role.name} but has not verified.")
+                                # don't notify yet
+                                member = await guild.fetch_member(user_id)
+                                if member:
+                                    try:
+                                        print(f"Sending notification to {member.name}")
+                                        await self.log_message(guild.id, f"Sending notification to {member.name} to get a token.")
+                                        await member.send(f"Please follow the steps provided to validate your membership.")
+                                        await self.on_member_join(member)
+                                    except:
+                                        await self.log_message(guild.id, f"Can't send PM to user {member.name}")
+                                        print(f"Can't send PM to user {member.name}")
+                                else:
+                                    print(f"Member {user_id} not found in {guild.name}")
+                            else:
+                                notified_at = existing_entry[0]
+                                #print(f"User {discord_user.name} already notified on {notified_at}")
+                                if (datetime.datetime.now() - notified_at).days >= 1:
+                                    # remove role if notified at least 7 days ago
+                                    member = await guild.fetch_member(user_id)
+                                    if member:
+                                        # don't do anything yet just log what it would do
+                                        try:
+                                            await member.remove_roles(role)
+                                        except:
+                                            print(f"Unable to remove {role.name} from user {user_id} on {guild.name}")
+                                            await self.log_message(guild.id, f"Unable to remove {role.name} from user {member.name}. Please check permissions.")
+                                        try:
+                                            await member.send(f"Your role '{role.name}' on '{guild.name}' has been removed as you have not validated your membership.")
+                                            print(f"Removed role {role.name} from user {user_id} in guild {guild_id}")
+                                            await self.log_message(guild.id,f"Removed role {role.name} from user {member.name}, as they have not validated their membership, notifed user on {notified_at}")
+                                        except:
+                                            await self.log_message(guild.id, f"Can't send PM to user {member.name}")
+                                            print(f"Can't send PM to user {member.name}")
+
+                                        # remove entry from unauthorized_users
+
+                                        cursor.execute("DELETE FROM unauthorized_users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
+                                        cnx.commit()
+                                    else:
+                                        print(f"Unable to find {member.name} on server {guild.name}")
+                                        await self.log_message(guild.id, f"Unable to find {member.name} on this server.")
+                print("Daily task complete.")
+            else:
+                print("Skipping daily task, already complete.")
+            cursor.close()
+        except mysql.connector.Error as e:
+            print(f"Fatal DB error in daily_task, exiting: {e}")
+            os._exit(1)
+
+
+
+    @tasks.loop(seconds=60) # run every 60 seconds
+    async def check_user_states(self):
+        try:
+            cursor=get_cursor()
+
+            cursor.execute("SELECT user_id, guild_id FROM user_states")
+            cursor.fetchall()
+            #print("user_states:", cursor.fetchall())
+
+            cursor.execute("SELECT discord_user_id FROM user_authorizations")
+            cursor.fetchall()
+            #print("user_authorizations:", cursor.fetchall())
+
+            cursor.execute("SELECT guild_id, role_id FROM server_roles")
+            cursor.fetchall()
+            #print("server_roles:", cursor.fetchall())
+
+
+            #print(f"Checking for authorizations and cleaning up state table at {datetime.datetime.now()}")
+            # check if we have any new authorizations
+            cursor.execute("""
+                    SELECT ua.discord_user_id, us.guild_id, sr.role_id
+                    FROM user_authorizations ua
+                    JOIN user_states us ON ua.discord_user_id = us.user_id
+                    JOIN server_roles sr ON us.guild_id = sr.guild_id
+                """)
+            results = cursor.fetchall()
+            cursor.close()
+            #print(f"Found {len(results)}")
+            for user_id, guild_id, role_id in results:
+                print(f"User id: {user_id} guild id: {guild_id} role id: {role_id}")
+                guild = await self.fetch_guild(guild_id)
+                if guild:
+                    member = await guild.fetch_member(user_id)
+                    if member:
+                        role = discord.utils.get(guild.roles, id=role_id)
+                        if role:
+                            try:
+                                await member.add_roles(role)
+                                                        # === Get user info for welcome message ===
+                                cursor = get_cursor()
+                                cursor.execute("SELECT access_token FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                                auth_row = cursor.fetchone()
+                                cursor.fetchall()
+
+                                if auth_row and auth_row[0]:
+                                    cursor.execute("""
+                                        SELECT firstName, lastName, membershipNumber
+                                        FROM `mes-portal`.User
+                                        WHERE membershipNumber = %s
+                                    """, (auth_row[0],))
+                                    user_row = cursor.fetchone()
+                                    cursor.fetchall()
+                                    cursor.close()
+
+                                    user_result = f"{user_row[0]} {user_row[1]}" if user_row else "Unknown"
+                                    auth_result = f"({user_row[2]})" if user_row else ""
+                                else:
+                                    user_result = ""
+                                    auth_result = ""
+
+                                welcome_text = f"Welcome {member.mention} {user_result} {auth_result} membership verified!"
+
+                                # Send welcome message
+                                ver_channel_id = await self.get_ver_channel(guild_id)
+                                if ver_channel_id:
+                                    ver_channel = await guild.fetch_channel(ver_channel_id)
+                                    if ver_channel:
+                                        await ver_channel.send(welcome_text)
+                                    else:
+                                        await self.log_message(guild_id, f"⚠️ Verification channel {ver_channel_id} no longer exists!")
+                                else:
+                                    await self.log_message(guild_id, welcome_text)
+
+                                await self.log_message(guild_id, f"Member {member.name} {user_result} {auth_result} assigned role {role.name} via stored token.")
+                                await member.send(f"✅ You've been assigned the role '{role.name}' on {guild.name} automatically.")
+                                print(f"✅ Assigned role {role.name} to {member.display_name} in {guild.name}")
+                                await self.log_message(guild_id, f"✅ Assigned role {role.name} to {member.display_name}.")
+                            except:
+                                print(f"Error assigning role {role.name} to {member.display_name} in {guild.name}")
+                                await self.log_message(guild_id, f"Error assigning role {role.name} to {member.display_name}. Please check bot permissions.")
+                        else:
+                            print(f"⚠️ Role with ID {role_id} not found in guild {guild.name}.")
+                            await self.log_message(guild_id, f"⚠️ Role with ID {role_id} not found.")
+                    else:
+                        print(f"⚠️ Member {user_id} not found in guild {guild_id}.")
+                        await self.log_message(guild_id, f"⚠️ Member {user_id} not found on this server.")
+                else:
+                    print(f"⚠️ Guild {guild_id} not found.")
+                cursor=get_cursor()
+                cursor.execute("DELETE FROM user_states WHERE user_id = %s", (user_id,))
+                cnx.commit()
+                cursor.close()
+
+            # removed expired oauth states from the database
+            five_minutes_ago = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=15)
+            cursor=get_cursor()
+            cursor.execute("SELECT * FROM user_states WHERE timestamp < %s", (five_minutes_ago,))
+            results=cursor.fetchall()
+            cursor.close()
+            #if not results:
+            #    print(f"No cleanup to do for the state table")
+            for result in results:
+                print(f"Removing {result} at {datetime.datetime.now()}")
+                cursor=get_cursor()
+                cursor.execute("DELETE FROM user_states WHERE timestamp < %s", (five_minutes_ago,))
+                cnx.commit()
+                cursor.close()
+                state = result[0]
+                user_id = result[1]
+                try:
+                    cursor=get_cursor()
+                    cursor.execute("SELECT message_id FROM auth_messages WHERE state = %s", (state,))
+                    msg_result = cursor.fetchone()
+                    cursor.fetchall()
+                    cursor.close()
+                except:
+                    print(f"Error updating expired link in message {state}")
+                if msg_result:
+                    message_id = msg_result[0]
+                    user = await self.fetch_user(user_id)
+                    dm_channel = user.dm_channel
+                    if dm_channel:
+                        message = await dm_channel.fetch_message(message_id)
+                        new_content = "[🔗 Link Expired]\nuse command !auth to request a new link"
+                        await message.edit(content=new_content)
+                        print(f"Link expired message updated {message_id}")
+                    else:
+                        print(f"Unable to DM {user.name}")
+                else:
+                    print(f"Message {state} not found")
+                try:
+                    cursor=get_cursor()
+                    cursor.execute("DELETE FROM auth_messages where state = %s", (state,))
+                    cnx.commit()
+                    cursor.close()
+                except:
+                    print(f"Error removing {state} from auth_messages")
+        except mysql.connector.Error as e:
+            print(f"Fatal DB error in check_user_states, exiting: {e}")
+            os._exit(1)
+
+
+    @check_user_states.before_loop
+    async def before_check_user_states(self):
+        """ Wait until bot is ready before running the loop """
+        await self.wait_until_ready()
+
+    async def on_message(self, message):
+        if message.author.id == self.user.id:
+            return
+        try:
+            if message.content.startswith('!help'):
+                if isinstance(message.author, discord.Member):
+                    if message.author.guild_permissions.administrator:
+                        await message.reply("!role to configure what role MESBot will assign to verified members.(Available only to admins)\n!id <user id> to identify name and membership number for a verified member.\n!auth to reauthenticate to the portal, this will extend or create your login token. \n!expire will delete your login token \n !setlog <channel name> to set the logging channel for the bot.(Available only to admins) \n Please visit https://www.modernenigmasociety.org/mesbot-documentation/ for more information.")
+                else:
+                    await message.reply("!id <user id> to identify name and membership for a verified member\n!auth to reauthenticate to the portal, this will extend or create your login token. \n!expire will delete your login token \n Please visit https://www.modernenigmasociety.org/mesbot-documentation/ for more information.")
+            if message.content.startswith('!auth'):
+                if isinstance(message.author, discord.Member):
+                    #do something here to authenticate the user like on_join
+                    await self.on_member_join(message.author)
+                    return
+                else:
+                    guild = None
+                    parts = message.content.split(" ",1)
+                    if len(parts) < 2:
+                        await message.reply("❌ You must specify a server name or server id with this command. e.g. !auth Modern Enigma Society")
+                        return
+                    else:
+                        server=parts[1]
+                        if server.isdigit():
+                            guild = await self.fetch_guild(int(server))
+                        else:
+                            for g in self.guilds:
+                                if g.name.lower() == server.lower():
+                                    guild = g
+                                    break
+                        if not guild:
+                            await message.reply("❌ Guild not found.")
+                            return
+                        try:
+                            member = await guild.fetch_member(message.author.id)
+                            await self.on_member_join(member)
+                        except:
+                            await message.reply(f"❌ You are not a member of {guild.name}")
+                            print(f"Unable to find member {message.author.id} on server {guild.name}")
+
+            if message.content.startswith('!expire'):
+                #delete the user token from user_authorizations
+                cursor=get_cursor()
+                user_id = message.author.id
+                try:
+                    cursor.execute("DELETE FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                    cnx.commit()
+                    await message.reply("✅ Token removed, please use !auth to get a new token.")
+                except:
+                    await message.reply("❌ Token not found.")
+                cursor.close()
+                return
+            if message.content.startswith('!id'):
+                cursor=get_cursor()
+                cursor.execute("SELECT discord_user_id FROM user_authorizations WHERE discord_user_id = %s", (message.author.id,))
+                author=cursor.fetchone()
+                cursor.fetchall()
+                if not author:
+                    await message.reply("Only verified members can use this command.")
+                    return
+                parts = message.content.split(maxsplit=1)
+                if len(parts) < 2:
+                    await message.reply("Please specify a user id to identify.")
+                else:
+                    user_id=int(parts[1])
+                    cursor=get_cursor()
+                    cursor.execute("SELECT access_token FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                    auth_result = cursor.fetchone()
+                    cursor.fetchall()
+                    if auth_result:
+                        cursor.execute("""
+                            SELECT firstName, lastName FROM `mes-portal`.User
+                            WHERE membershipNumber = (SELECT access_token FROM user_authorizations WHERE discord_user_id = %s)
+                        """, (user_id,))
+                        user_result = cursor.fetchone()
+                        cursor.fetchall()
+                        cursor.close()
+                        await message.reply(f"User id: {user_id} is {user_result} {auth_result}")
+                        return
+                    else:
+                        await message.reply(f"User id: {user_id} not found")
+                        return
+
+            if message.content.startswith('!role'):
+                if not message.author.guild_permissions.administrator:
+                    await message.reply("❌ You must be an administrator to use this command.")
+                    return
+                parts = message.content.split(maxsplit=1)
+                if len(parts) < 2:
+                    cursor=get_cursor()
+                    cursor.execute("SELECT role_id from server_roles WHERE guild_id = %s", (message.guild.id,))
+                    role_data = cursor.fetchone()
+                    cursor.fetchall()
+                    if role_data:
+                        role = discord.utils.get(message.guild.roles, id=role_data[0])
+                        if role:
+                            await message.reply(f"Current assigned member role is '{role.name}'")
+                            return
+                    await message.reply("Please specify a role ID or name")
+                    cursor.close()
+                    return
+
+                command, role_input = parts[0], parts[1]
+
+                role = None
+                try:
+                    role_id = int(role_input)
+                    role = discord.utils.get(message.guild.roles, id=role_id)
+                except ValueError:
+                    #if not a value try matching by name
+                    role = discord.utils.get(message.guild.roles, name=role_input)
+
+                if role:
+                    guild_id = message.guild.id
+                    role_id = role.id
+                    cursor=get_cursor()
+                    try:
+                        cursor.execute(
+                                "INSERT INTO server_roles (guild_id, role_id) VALUES (%s, %s) "
+                                "ON DUPLICATE KEY UPDATE role_id = %s",
+                                (guild_id, role_id, role_id)
+                        )
+                        cnx.commit()
+                        await message.reply(f"Role found: {role.name} (ID: {role.id})")
+                    except mysql.connector.Error as err:
+                        print(f"Database Error: {err}")
+                        await message.reply("❌ An error occurred while saving the role.")
+                    cursor.close()
+
+                else:
+                    print(f"No matching role {role_input} found.")
+                    await message.reply("No matching role found.")
+
+            if message.content.startswith('!setlog'):
+                # command to set logging channel for the server
+                if not message.author.guild_permissions.administrator:
+                    await message.reply("❌ You must be an administrator to use this command.")
+                    return
+                if isinstance(message.channel, discord.DMChannel):
+                    await message.reply("❌ This command cannot be used in DMs.")
+                    return
+                parts = message.content.split(maxsplit=1)
+                guild_id = message.guild.id
+                channel_id = message.channel.id
+                if len(parts) < 2:
+                    cursor=get_cursor()
+                    cursor.execute("""
+                        INSERT INTO server_logging (guild_id, channel_id)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE channel_id = VALUES(channel_id)
+                    """, (guild_id, channel_id))
+                    cnx.commit()
+                    await self.log_message(guild_id, f"Logging channel set to {channel_id}")
+                    print(f"Logging channel set to {channel_id} on server {guild_id}")
+                    # send a log
+                    return
+                else:
+                    if message.channel_mentions:
+                        channel_id = message.channel_mentions[0].id
+                        if channel_id:
+                            cursor=get_cursor()
+                            cursor.execute("""
+                                INSERT INTO server_logging (guild_id, channel_id)
+                                VALUES (%s, %s)
+                                ON DUPLICATE KEY UPDATE channel_id = VALUES(channel_id)
+                            """, (guild_id, channel_id))
+                            cnx.commit()
+                            cursor.close()
+                            # send a log
+                            await self.log_message(guild_id, f"Logging channel set to {channel_id}")
+                            print(f"Logging channel set to {channel_id} on server {guild_id}")
+                            return
+                        else:
+                            await message.reply("❌ Could not find channel {parts[1]}.")
+                    else:
+                        await message.reply(f"❌ Could not find a channel mention in '{parts[1]}'.")
+                        return
+            if message.content.startswith('!setver'):
+                if not message.author.guild_permissions.administrator:
+                    await message.reply("❌ You must be an administrator to use this command.")
+                    return
+                if isinstance(message.channel, discord.DMChannel):
+                    await message.reply("❌ This command cannot be used in DMs.")
+                    return
+
+                parts = message.content.split(maxsplit=1)
+                guild_id = message.guild.id
+                if len(parts) < 2 or not message.channel_mentions:
+                    await message.reply("❌ Please mention a channel. Example: `!setver #verification`")
+                    return
+
+                channel_id = message.channel_mentions[0].id
+                cursor = get_cursor()
+                try:
+                    cursor.execute("""
+                        INSERT INTO server_verification (guild_id, channel_id)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE channel_id = VALUES(channel_id)
+                    """, (guild_id, channel_id))
+                    cnx.commit()
+                    await message.reply(f"✅ Verification channel set to <#{channel_id}>")
+                except mysql.connector.Error as err:
+                    print(f"Database Error: {err}")
+                    await message.reply("❌ Failed to save verification channel.")
+                finally:
+                    cursor.close()
+                return
+        except mysql.connector.Error as e:
+            print(f"DB error in on_message from {message.author.id}: {e}")
+            return
+
+
+
+    async def on_member_join(self, member):
+        try:
+            # check if user is authorized
+            cursor=get_cursor()
+            cursor.execute(
+                    "SELECT last_authorized FROM user_authorizations WHERE discord_user_id = %s",
+                    (member.id,)
+            )
+            result = cursor.fetchone()
+            cursor.fetchall()
+            cursor.close()
+            if result:
+                last_authorized = result[0]
+                if last_authorized:
+                    # user with authorized no need for oauth
+                    cursor=get_cursor()
+                    cursor.execute("SELECT role_id FROM server_roles WHERE guild_id = %s", (member.guild.id,))
+                    role_data = cursor.fetchone()
+                    cursor.fetchall()
+                    cursor.close()
+                    if role_data:
+                        role = discord.utils.get(member.guild.roles, id=role_data[0])
+                        if role:
+                            try:
+                                await member.add_roles(role)
+                                # === Get user_result and auth_result ===
+                                cursor = get_cursor()
+                                cursor.execute("SELECT access_token FROM user_authorizations WHERE discord_user_id = %s", (member.id,))
+                                auth_row = cursor.fetchone()
+                                cursor.fetchall()
+                                if auth_row and auth_row[0]:
+                                    cursor.execute("""
+                                        SELECT firstName, lastName, membershipNumber
+                                        FROM `mes-portal`.User
+                                        WHERE membershipNumber = %s
+                                    """, (auth_row[0],))
+                                    user_row = cursor.fetchone()
+                                    cursor.fetchall()
+                                    cursor.close()
+                                    if user_row:
+                                        user_result = f"{user_row[0]} {user_row[1]}"
+                                        auth_result = f"({user_row[2]})"
+                                    else:
+                                        user_result = ""
+                                        auth_result = ""
+                                else:
+                                    user_result = ""
+                                    auth_result = ""
+                                welcome_text = f"Welcome {member.mention} {user_result} {auth_result} membership verified!"
+                                await member.send(f"You've been assigned the role '{role.name}' on server '{member.guild.name}' automatically via your stored token.")
+                                ver_channel_id = await self.get_ver_channel(member.guild.id)
+                                if ver_channel_id:
+                                    guild = await self.fetch_guild(member.guild.id)
+                                    ver_channel = await guild.fetch_channel(ver_channel_id) if guild else None
+                                    if ver_channel:
+                                        await ver_channel.send(welcome_text)
+                                    else:
+                                        # Verification channel deleted
+                                        await self.log_message(member.guild.id, f"⚠️ Verification channel {ver_channel_id} no longer exists!")
+                                await self.log_message(member.guild.id,welcome_text)
+                            except Exception as e:
+                                print(f"Error assigning role to {member.name} on {member.guild.name}: {e}")
+                                await self.log_message(member.guild.id,f"Error: Unable to assign {member.name} role {role.name}: {e}")
+                            return
+                        else:
+                            print(f"Unable to locate role id {role_data[0]} in server {member.guild.name}")
+                            await self.log_message(member.guild.id,f"Error: Unable to load role id {role_data[0]}")
+                            return
+                    else:
+                        print(f"Unable to load role from database for server {member.guild.name}")
+                        await self.log_message(member.guild.id,f"Unable to load role from database. Please check that a role is configured correctly.")
+                        return
+            else:
+                # user has no token
+                # redirect to auth
+                state = str(uuid.uuid4())
+                cursor=get_cursor()
+                cursor.execute(
+                    "INSERT INTO user_states (state, user_id, guild_id, timestamp) VALUES (%s, %s, %s, %s)",
+                    (state, member.id, member.guild.id, datetime.datetime.now())
+                )
+                cnx.commit()
+                cursor.close()
+                print(f"Wrote state {state} into state table with user_id {member.id} and guild id {member.guild.id} at {datetime.datetime.now()}")
+                auth_url = f"https://discord.modernenigmasociety.org/oauth/authorize?state={state}"
+                try:
+                    message = await member.send(f"If you are an MES member, this bot is setup to automatically validate your membership and give you full access to MES discord servers.\nPlease authenticate with our service by clicking here: {auth_url}\nThis link expires after 15 minutes, and you can use the !auth command to generate a new link.\nIf you have questions or are interested in joining one of our LARPs, you can ask questions and get advice in the welcome room without verification or membership. https://discord.gg/dEudtugYdM")
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    print(f"Could not DM auth link to {member.id}: {e}")
+                    return
+                # Store message_id and state
+                cursor=get_cursor()
+                cursor.execute("""
+                    INSERT INTO auth_messages (state, message_id, timestamp)
+                    VALUES (%s, %s, %s)
+                    """, (state, message.id, datetime.datetime.now()))
+                cnx.commit()
+                cursor.close()
+        except mysql.connector.Error as e:
+            print(f"DB error in on_member_join for {member.id}: {e}")
+            return
+
+    async def log_message(self, guild_id, message):
+        # logs a message in the configured logging channel or else does nothing
+        cursor=get_cursor()
+        cursor.execute("SELECT channel_id FROM server_logging WHERE guild_id = %s", (guild_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        if result:
+            channel_id=result[0]
+            guild = await self.fetch_guild(guild_id)
+            if guild:
+                log_channel = await guild.fetch_channel(channel_id)
+                if log_channel:
+                    await log_channel.send(message)
+                else:
+                    print(f"⚠️ Logging channel {channel_id} not found in guild {guild_id}.")
+            else:
+                print(f"⚠️ Guild {guild_id} not found.")
+        else:
+            print(f"⚠️ No logging channel set for guild {guild_id}.")
+
+    async def get_ver_channel(self, guild_id: int):
+        """Returns verification channel ID or None"""
+        cursor = get_cursor()
+        try:
+            cursor.execute("SELECT channel_id FROM server_verification WHERE guild_id = %s", (guild_id,))
+            result = cursor.fetchone()
+            return result[0] if result else None
+        finally:
+            cursor.close()
+
+
+
+
+intents=discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.guilds = True
+
+try:
+  cnx = mysql.connector.connect(user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), host= os.getenv('DB_SERVER'),
+                                database=os.getenv('DB_DATABASE'))
+except mysql.connector.Error as err:
+  if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+    print("Something is wrong with your user name or password")
+  elif err.errno == errorcode.ER_BAD_DB_ERROR:
+    print("Database does not exist")
+  else:
+    print(err)
+
+#cursor=cnx.cursor()
+
+client = MyClient(intents=intents)
+client.run(os.getenv('TOKEN'))
