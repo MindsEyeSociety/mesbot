@@ -409,6 +409,47 @@ class MyClient(discord.Client):
                     cursor.close()
                 except:
                     print(f"Error removing {state} from auth_messages")
+            # --- Event role periodic scan ---
+            cursor = get_cursor()
+            cursor.execute("SELECT guild_id, event_id, role_id FROM server_event_roles")
+            event_configs = cursor.fetchall()
+            cursor.close()
+
+            for guild_id, event_id, role_id in event_configs:
+                try:
+                    guild = await self.fetch_guild(guild_id)
+                except (discord.NotFound, discord.HTTPException):
+                    continue
+                if not guild:
+                    continue
+
+                role = discord.utils.get(guild.roles, id=role_id)
+                if not role:
+                    continue
+
+                cursor = get_cursor()
+                cursor.execute("""
+                    SELECT DISTINCT ua.discord_user_id
+                    FROM user_authorizations ua
+                    JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
+                    WHERE ea.event_id = %s
+                """, (event_id,))
+                attendee_ids = [row[0] for row in cursor.fetchall()]
+                cursor.close()
+
+                for discord_id in attendee_ids:
+                    try:
+                        member = await guild.fetch_member(discord_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        continue
+                    if member and role not in member.roles:
+                        try:
+                            await member.add_roles(role)
+                            await self.log_message(guild_id, f"✅ Assigned event role {role.name} to {member.display_name}.")
+                            print(f"✅ Assigned event role {role.name} to {member.display_name} in {guild.name}")
+                        except (discord.Forbidden, discord.HTTPException) as e:
+                            print(f"Failed to assign event role to {discord_id}: {e}")
+
         except mysql.connector.Error as e:
             print(f"Fatal DB error in check_user_states, exiting: {e}")
             os._exit(1)
@@ -426,7 +467,7 @@ class MyClient(discord.Client):
             if message.content.startswith('!help'):
                 if isinstance(message.author, discord.Member):
                     if message.author.guild_permissions.administrator:
-                        await message.reply("!role to configure what role MESBot will assign to verified members.(Available only to admins)\n!id <user id> to identify name and membership number for a verified member.\n!auth to reauthenticate to the portal, this will extend or create your login token. \n!expire will delete your login token \n !setlog <channel name> to set the logging channel for the bot.(Available only to admins) \n Please visit https://www.modernenigmasociety.org/mesbot-documentation/ for more information.")
+                        await message.reply("!role to configure what role MESBot will assign to verified members.(Available only to admins)\n!id <user id> to identify name and membership number for a verified member.\n!auth to reauthenticate to the portal, this will extend or create your login token. \n!expire will delete your login token \n !setlog <channel name> to set the logging channel for the bot.(Available only to admins) \n Please visit https://www.modernenigmasociety.org/mesbot-documentation/ for more information.\n!setevent <event_id> <role> to configure event role assignment (admin). !clearevent to remove the event configuration (admin).")
                 else:
                     await message.reply("!id <user id> to identify name and membership for a verified member\n!auth to reauthenticate to the portal, this will extend or create your login token. \n!expire will delete your login token \n Please visit https://www.modernenigmasociety.org/mesbot-documentation/ for more information.")
             if message.content.startswith('!auth'):
@@ -626,6 +667,82 @@ class MyClient(discord.Client):
                 finally:
                     cursor.close()
                 return
+
+            if message.content.startswith('!setevent'):
+                if not message.author.guild_permissions.administrator:
+                    await message.reply("❌ You must be an administrator to use this command.")
+                    return
+                if isinstance(message.channel, discord.DMChannel):
+                    await message.reply("❌ This command cannot be used in DMs.")
+                    return
+                parts = message.content.split(maxsplit=2)
+                if len(parts) < 3:
+                    # Show current config
+                    cursor = get_cursor()
+                    cursor.execute(
+                        "SELECT event_id, role_id FROM server_event_roles WHERE guild_id = %s",
+                        (message.guild.id,)
+                    )
+                    config = cursor.fetchone()
+                    cursor.fetchall()
+                    cursor.close()
+                    if config:
+                        role = discord.utils.get(message.guild.roles, id=config[1])
+                        role_name = role.name if role else f"<deleted role {config[1]}>"
+                        await message.reply(f"Current event: ID {config[0]}, role '{role_name}'")
+                    else:
+                        await message.reply("No event configured. Use `!setevent <event_id> <role name or ID>`")
+                    return
+                _, event_id_str, role_input = parts
+                try:
+                    event_id = int(event_id_str)
+                except ValueError:
+                    await message.reply("❌ Event ID must be a number.")
+                    return
+                role = None
+                try:
+                    role_id = int(role_input)
+                    role = discord.utils.get(message.guild.roles, id=role_id)
+                except ValueError:
+                    role = discord.utils.get(message.guild.roles, name=role_input)
+                if not role:
+                    await message.reply(f"❌ No matching role '{role_input}' found.")
+                    return
+                cursor = get_cursor()
+                try:
+                    cursor.execute(
+                        "INSERT INTO server_event_roles (guild_id, event_id, role_id) VALUES (%s, %s, %s) "
+                        "ON DUPLICATE KEY UPDATE event_id = %s, role_id = %s",
+                        (message.guild.id, event_id, role.id, event_id, role.id)
+                    )
+                    cnx.commit()
+                    await message.reply(f"✅ Event {event_id} configured with role '{role.name}'.")
+                except mysql.connector.Error as err:
+                    print(f"Database Error: {err}")
+                    await message.reply("❌ An error occurred while saving the event configuration.")
+                finally:
+                    cursor.close()
+                return
+
+            if message.content.startswith('!clearevent'):
+                if not message.author.guild_permissions.administrator:
+                    await message.reply("❌ You must be an administrator to use this command.")
+                    return
+                if isinstance(message.channel, discord.DMChannel):
+                    await message.reply("❌ This command cannot be used in DMs.")
+                    return
+                cursor = get_cursor()
+                try:
+                    cursor.execute("DELETE FROM server_event_roles WHERE guild_id = %s", (message.guild.id,))
+                    cnx.commit()
+                    await message.reply("✅ Event role configuration removed.")
+                except mysql.connector.Error as err:
+                    print(f"Database Error: {err}")
+                    await message.reply("❌ An error occurred while removing the event configuration.")
+                finally:
+                    cursor.close()
+                return
+
         except mysql.connector.Error as e:
             print(f"DB error in on_message from {message.author.id}: {e}")
             return
@@ -695,15 +812,14 @@ class MyClient(discord.Client):
                             except Exception as e:
                                 print(f"Error assigning role to {member.name} on {member.guild.name}: {e}")
                                 await self.log_message(member.guild.id,f"Error: Unable to assign {member.name} role {role.name}: {e}")
-                            return
                         else:
                             print(f"Unable to locate role id {role_data[0]} in server {member.guild.name}")
                             await self.log_message(member.guild.id,f"Error: Unable to load role id {role_data[0]}")
-                            return
                     else:
                         print(f"Unable to load role from database for server {member.guild.name}")
                         await self.log_message(member.guild.id,f"Unable to load role from database. Please check that a role is configured correctly.")
-                        return
+                    await self.assign_event_role(member)
+                    return
             else:
                 # user has no token
                 # redirect to auth
@@ -764,7 +880,53 @@ class MyClient(discord.Client):
         finally:
             cursor.close()
 
+    async def assign_event_role(self, member: discord.Member):
+        """Assign the event role to a member if they are a registered event attendee.
 
+        Checks server_event_roles for this guild's configured event, then verifies the
+        member's MES membership number appears in mes-portal.EventAttendee for that event.
+        Does nothing if no event is configured for this guild, the role is already
+        assigned, or the member has not completed OAuth verification.
+
+        @param member: The guild member to check and potentially assign the event role.
+        @see check_user_states
+        """
+        cursor = get_cursor()
+        cursor.execute(
+            "SELECT event_id, role_id FROM server_event_roles WHERE guild_id = %s",
+            (member.guild.id,)
+        )
+        config = cursor.fetchone()
+        cursor.fetchall()
+        cursor.close()
+        if not config:
+            return
+        event_id, role_id = config
+
+        role = discord.utils.get(member.guild.roles, id=role_id)
+        if not role or role in member.roles:
+            return
+
+        cursor = get_cursor()
+        cursor.execute("""
+            SELECT 1
+            FROM user_authorizations ua
+            JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
+            WHERE ua.discord_user_id = %s AND ea.event_id = %s
+            LIMIT 1
+        """, (member.id, event_id))
+        is_attendee = cursor.fetchone()
+        cursor.fetchall()
+        cursor.close()
+
+        if is_attendee:
+            try:
+                await member.add_roles(role)
+                await self.log_message(member.guild.id, f"✅ Assigned event role {role.name} to {member.display_name}.")
+                print(f"✅ Assigned event role {role.name} to {member.display_name} in {member.guild.name}")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                print(f"Failed to assign event role to {member.id}: {e}")
+                await self.log_message(member.guild.id, f"❌ Failed to assign event role to {member.display_name}: {e}")
 
 
 intents=discord.Intents.default()
