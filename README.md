@@ -84,6 +84,12 @@ Admin commands cannot be sent via DM and require the Administrator permission.
 
 MESBot needs permission to view channels, send messages, and (optionally) control the server ban list. Users will also need to allow MESBot to send DMs, as sign-in URLs cannot be posted publicly for security.
 
+## Configuration
+
+| Variable | Description |
+|---|---|
+| `LOG_LEVEL` | Logging verbosity. `INFO` (default) logs operational events. `DEBUG` enables detailed tracing including OAuth state tokens and membership data — for troubleshooting only. |
+
 ## How It Works
 
 On the backend MESBot has read-only access to our membership database to provide membership expiration reminders to users, and full access to its own private database to track server settings and user tokens. Authentication is implemented via oauth v2 which is part of our membership portal. Oauth v2 is a single sign-on standard used by many major providers like Microsoft and Google.
