@@ -48,6 +48,23 @@ def is_membership_expired(membership_expiration: str) -> bool:
 
 @app.route("/oauth/callback")
 def oauth_callback():
+    """Complete the OAuth flow and record the member's authorization.
+
+    Exchanges the authorization ``code`` for an access token, fetches the member's
+    portal profile, and rejects anyone without a current Full/Trial membership. On
+    success it upserts a row into ``user_authorizations`` keyed by the Discord user
+    id resolved from the pending ``user_states`` row (matched by ``state`` within a
+    15-minute window).
+
+    It deliberately does NOT delete the ``user_states`` row: the bot's
+    ``check_user_states`` loop relies on that row to discover the new authorization,
+    assign the configured role, post the welcome message, and then remove the row
+    itself. See the inline note below.
+
+    @return A Flask ``(body, status)`` tuple: ``("Success", 200)`` on success, or a
+        4xx/5xx error describing why verification failed (missing code, token/profile
+        fetch failure, invalid/expired membership, or an expired/unknown state link).
+    """
     state = request.args.get("state")
     code = request.args.get("code")
     if not code:
@@ -129,7 +146,13 @@ def oauth_callback():
             "ON DUPLICATE KEY UPDATE last_authorized = CURRENT_TIMESTAMP",
             (user_id, user_info['membershipNumber'])
     )
-    cursor.execute("DELETE FROM user_states WHERE state = %s", (state,))
+    # NOTE: do not delete the user_states row here. The bot's check_user_states loop
+    # joins user_authorizations -> user_states -> server_roles to discover that this
+    # user just authorized, assigns the configured role + posts the welcome, and then
+    # deletes the user_states row itself (within <=60s). Deleting it here removes the
+    # row before the loop can ever match it, leaving already-present members without
+    # their role. Single-use of the state is preserved by that prompt cleanup and the
+    # 15-minute timestamp window checked above.
     cnx.commit()
     cursor.close()
     return f"Success", 200

@@ -198,6 +198,27 @@ class MyClient(discord.Client):
                     members = [member async for member in guild.fetch_members()]
                     logger.info(f"Fetched {len(members)} members from {guild.name}")
 
+                    # Self-heal: grant the configured role to any member who is verified with a
+                    # currently-valid membership but is missing it. This is the permanent-record
+                    # safety net for the per-OAuth assignment path in check_user_states — if that
+                    # path is ever interrupted, the daily run reconciles from user_authorizations.
+                    # Silent on purpose: no welcome DMs/channel posts during a bulk reconcile.
+                    cursor.execute("""
+                        SELECT ua.discord_user_id
+                        FROM user_authorizations ua
+                        JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
+                        WHERE u.membershipExpiration >= CURDATE()
+                    """)
+                    valid_authorized = {row[0] for row in cursor.fetchall()}
+                    for member in members:
+                        if member.id in valid_authorized and role not in member.roles:
+                            try:
+                                await member.add_roles(role)
+                                logger.info(f"Self-heal: assigned role {role.name} to {member.display_name} in {guild.name}")
+                                await self.log_message(guild_id, f"✅ Self-heal: assigned role {role.name} to {member.display_name} (membership verified).")
+                            except (discord.Forbidden, discord.HTTPException) as e:
+                                logger.error(f"Self-heal: failed to assign {role.name} to {member.id} in {guild.name}: {e}")
+
                     users_with_role = [member.id for member in members if role in member.roles]
 
                     logger.info(f"Users with {role_id} are {users_with_role}")
