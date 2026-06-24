@@ -29,7 +29,7 @@ MESBot authenticates discord users via the membership portal oauth sign-on, givi
 
 ### Role Assignment
 
-Server admins can configure a server role that MESBot will control. It will verify that the role exists and store this setting in our database. When a user joins the server, they will receive a link to authenticate via the portal, if they already have a token, they will automatically be given the role you configured. If the discord user does not have a current membership they will not get the role. Any users who have the server role but not a token will get a daily reminder to login, and after 7 days will lose the role.
+Server admins can configure a server role that MESBot will control. It will verify that the role exists and store this setting in our database. When a user joins the server, they will receive a link to authenticate via the portal, if they already have a token, they will automatically be given the role you configured. Members who verify while already on the server receive the role automatically within about a minute. As a safety net, MESBot also reconciles daily and will grant the configured role to any verified member with a current membership who is missing it. If the discord user does not have a current membership they will not get the role. Any users who have the server role but not a token will get a daily reminder to login, and after 7 days will lose the role.
 
 ### Event Role Assignment
 
