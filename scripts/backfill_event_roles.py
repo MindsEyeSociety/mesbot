@@ -75,7 +75,7 @@ def connect_db():
     )
 
 
-def compute_grants(cursor, event_id):
+def compute_grants(cursor, event_id, ticketing_id=None, include_zeffy_email=False):
     """Return the verified members eligible for the event role for ``event_id``.
 
     Matches the permanent ``user_authorizations`` map against the event's attendees by the
@@ -84,31 +84,54 @@ def compute_grants(cursor, event_id):
     guard. Each returned member is annotated with how they matched so the audit can show
     which grants rely on the resolved account link versus the submitted number.
 
+    When ``include_zeffy_email`` is set (and ``ticketing_id`` is given), it ALSO matches
+    raw ``ZeffyDonation`` rows for the event by email (``ZeffyDonation.email`` ->
+    ``User.emailAddress``), including ``error``-status donations. This recovers members who
+    registered on Zeffy but whose registration failed the portal's processing and so never
+    produced an ``EventAttendee`` row. Use deliberately: ``error`` rows include failed/voided
+    payments, so review the audit before applying.
+
+    @param ticketing_id: The event's ``PortalEvent.zeffyTicketingId`` (required for the
+        Zeffy-email path).
     @return List of dicts: ``discord_user_id``, ``membership_number``, ``name``,
-        ``by_userid`` (bool: matched via the portal-resolved account link),
-        ``by_number`` (bool: matched via the submitted membership number).
+        ``by_userid`` (matched via the portal-resolved account link),
+        ``by_number`` (matched via the submitted membership number),
+        ``by_zeffy`` (matched via raw ZeffyDonation email, error-recovery path).
     """
-    query = """
+    params = [event_id, event_id]
+    if include_zeffy_email and ticketing_id:
+        zeffy_expr = (
+            "EXISTS(SELECT 1 FROM `mes-portal`.ZeffyDonation z "
+            "WHERE z.ticketing_id = %s AND z.status IN ('completed','error') "
+            "AND LOWER(z.email) = LOWER(u.emailAddress))"
+        )
+        params.append(ticketing_id)
+    else:
+        zeffy_expr = "0"
+
+    query = f"""
         SELECT ua.discord_user_id, u.membershipNumber, u.firstName, u.lastName,
                EXISTS(SELECT 1 FROM `mes-portal`.EventAttendee ea
                       WHERE ea.event_id = %s AND ea.user_id = u.id) AS by_userid,
                EXISTS(SELECT 1 FROM `mes-portal`.EventAttendee ea
                       WHERE ea.event_id = %s
-                        AND ea.membershipNumberSubmitted = ua.access_token) AS by_number
+                        AND ea.membershipNumberSubmitted = ua.access_token) AS by_number,
+               {zeffy_expr} AS by_zeffy
         FROM user_authorizations ua
         JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
         WHERE u.membershipExpiration >= CURDATE()
-        HAVING by_userid OR by_number
+        HAVING by_userid OR by_number OR by_zeffy
     """
-    cursor.execute(query, (event_id, event_id))
+    cursor.execute(query, tuple(params))
     grants = []
-    for discord_user_id, membership_number, first, last, by_userid, by_number in cursor.fetchall():
+    for discord_user_id, membership_number, first, last, by_userid, by_number, by_zeffy in cursor.fetchall():
         grants.append({
             "discord_user_id": discord_user_id,
             "membership_number": membership_number,
             "name": f"{first or ''} {last or ''}".strip() or "Unknown",
             "by_userid": bool(by_userid),
             "by_number": bool(by_number),
+            "by_zeffy": bool(by_zeffy),
         })
     return grants
 
@@ -137,13 +160,15 @@ def count_unlinked_valid(cursor, event_id):
     return value
 
 
-def build_plan(cnx):
+def build_plan(cnx, include_zeffy_email=False):
     """Build the per-guild remediation plan from the database (no Discord calls).
 
     Reads every configured event in ``server_event_roles`` and, for each, the eligible
     grant set plus the guild's verification/logging channel ids (so the apply phase needs
     no further DB access) and the count of valid-but-unlinked attendees.
 
+    @param include_zeffy_email: When set, broadens matching to raw ZeffyDonation emails
+        (including error-status) via the event's ``PortalEvent.zeffyTicketingId``.
     @return List of plan entries (dicts) with keys: ``guild_id``, ``event_id``,
         ``role_id``, ``ver_channel_id``, ``log_channel_id``, ``grants``, ``unlinked``.
     """
@@ -153,7 +178,13 @@ def build_plan(cnx):
 
     plan = []
     for guild_id, event_id, role_id in events:
-        grants = compute_grants(cursor, event_id)
+        ticketing_id = None
+        if include_zeffy_email:
+            cursor.execute("SELECT zeffyTicketingId FROM `mes-portal`.PortalEvent WHERE id = %s", (event_id,))
+            row = cursor.fetchone()
+            cursor.fetchall()
+            ticketing_id = row[0] if row else None
+        grants = compute_grants(cursor, event_id, ticketing_id, include_zeffy_email)
         unlinked = count_unlinked_valid(cursor, event_id)
 
         cursor.execute("SELECT channel_id FROM server_verification WHERE guild_id = %s", (guild_id,))
@@ -183,19 +214,18 @@ def print_plan(plan):
         return
     for entry in plan:
         grants = entry["grants"]
-        number_only = [g for g in grants if g["by_number"] and not g["by_userid"]]
+        zeffy_only = [g for g in grants if g["by_zeffy"] and not g["by_userid"] and not g["by_number"]]
         print(f"\n=== Guild {entry['guild_id']} | event {entry['event_id']} | "
               f"role {entry['role_id']} ===")
         print(f"  Eligible verified members: {len(grants)} "
-              f"(matched only via submitted number, not resolved account: {len(number_only)})")
+              f"(recovered only via raw Zeffy email / error-status: {len(zeffy_only)})")
         print(f"  Valid attendees with no linked Discord (cannot grant yet): {entry['unlinked']}")
         for g in grants:
-            if g["by_userid"] and g["by_number"]:
-                how = "account+number"
-            elif g["by_userid"]:
-                how = "account-link"
+            if g["by_userid"] or g["by_number"]:
+                how = "account+number" if (g["by_userid"] and g["by_number"]) else (
+                    "account-link" if g["by_userid"] else "submitted#-only")
             else:
-                how = "submitted#-only"
+                how = "zeffy-email (error-recovered)"
             print(f"    - {g['name']} (MES {g['membership_number']}, "
                   f"discord {g['discord_user_id']}) [{how}]")
 
@@ -292,6 +322,10 @@ def main():
                         help="Actually assign roles and send notifications (default: dry run).")
     parser.add_argument("--throttle", type=float, default=1.0,
                         help="Seconds to sleep between member grants (default: 1.0).")
+    parser.add_argument("--include-error-registrants", action="store_true",
+                        help="Also recover members from raw ZeffyDonation by email, including "
+                             "error-status registrations (failed/voided payments included). "
+                             "Review the audit before applying.")
     args = parser.parse_args()
 
     try:
@@ -301,7 +335,7 @@ def main():
         sys.exit(1)
 
     try:
-        plan = build_plan(cnx)
+        plan = build_plan(cnx, args.include_error_registrants)
     finally:
         cnx.close()
 
