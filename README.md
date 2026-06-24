@@ -94,6 +94,8 @@ MESBot needs permission to view channels, send messages, and (optionally) contro
 
 On the backend MESBot has read-only access to our membership database to provide membership expiration reminders to users, and full access to its own private database to track server settings and user tokens. Authentication is implemented via oauth v2 which is part of our membership portal. Oauth v2 is a single sign-on standard used by many major providers like Microsoft and Google.
 
+Maintainers: see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the deployment, database, Zeffy/event data flow, and role-assignment internals.
+
 ## Getting Help
 
 Known issues: No current known issues.
