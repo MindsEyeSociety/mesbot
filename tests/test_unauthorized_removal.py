@@ -117,6 +117,70 @@ async def test_daily_task_waits_within_grace_period(fake_db, discord_factories):
     member1.remove_roles.assert_not_awaited()  # still inside the grace window
 
 
+async def test_daily_task_forbidden_keeps_flag_and_reports_permissions(fake_db, discord_factories):
+    role1 = discord_factories.role(R1)
+    member1 = discord_factories.member(USER_ID, roles=[role1])
+    member1.remove_roles.side_effect = discord_factories.http_error(discord.Forbidden)
+    guild1 = discord_factories.guild(G1, roles=[role1])
+    guild1.fetch_members = lambda: _aiter([member1])
+    guild1.fetch_member = AsyncMock(return_value=member1)
+
+    client = _real_client()
+    client.fetch_guild = AsyncMock(return_value=guild1)
+
+    two_days_ago = datetime.datetime.now() - datetime.timedelta(days=2)
+    fake_db.responses = {
+        "FROM server_roles": [(G1, R1)],
+        "notified_at FROM unauthorized_users": [(two_days_ago,)],
+    }
+
+    await main.MyClient.daily_task.coro(client)
+
+    member1.remove_roles.assert_awaited_once()  # no retry on a permission error
+    # Flag is kept (no DELETE) so it retries and re-reports next run.
+    assert not any("DELETE FROM unauthorized_users" in s for s in fake_db.sql)
+    messages = [call.args[1] for call in client.log_message.await_args_list]
+    assert any("permission" in m.lower() for m in messages)
+
+
+# --- the remove-with-retry helper -------------------------------------------------------
+
+async def test_remove_retry_success_first_try(discord_factories):
+    role = discord_factories.role(R1)
+    member = discord_factories.member(USER_ID, roles=[role])
+    result = await main.MyClient._remove_role_with_retry(member, role, attempts=3, delay=0)
+    assert result == "removed"
+    member.remove_roles.assert_awaited_once_with(role)
+
+
+async def test_remove_retry_forbidden_does_not_retry(discord_factories):
+    role = discord_factories.role(R1)
+    member = discord_factories.member(USER_ID, roles=[role])
+    member.remove_roles.side_effect = discord_factories.http_error(discord.Forbidden)
+    result = await main.MyClient._remove_role_with_retry(member, role, attempts=3, delay=0)
+    assert result == "forbidden"
+    assert member.remove_roles.await_count == 1  # permission error reported immediately
+
+
+async def test_remove_retry_transient_gives_up_after_attempts(discord_factories):
+    role = discord_factories.role(R1)
+    member = discord_factories.member(USER_ID, roles=[role])
+    member.remove_roles.side_effect = discord_factories.http_error(discord.HTTPException)
+    result = await main.MyClient._remove_role_with_retry(member, role, attempts=3, delay=0)
+    assert result == "api_error"
+    assert member.remove_roles.await_count == 3  # retried up to the limit, then reported
+
+
+async def test_remove_retry_transient_then_succeeds(discord_factories):
+    role = discord_factories.role(R1)
+    member = discord_factories.member(USER_ID, roles=[role])
+    err = discord_factories.http_error(discord.HTTPException)
+    member.remove_roles.side_effect = [err, None]  # one transient failure, then success
+    result = await main.MyClient._remove_role_with_retry(member, role, attempts=3, delay=0)
+    assert result == "removed"
+    assert member.remove_roles.await_count == 2
+
+
 async def test_daily_task_flags_first_time_without_removing(fake_db, discord_factories):
     role1 = discord_factories.role(R1)
     member1 = discord_factories.member(USER_ID, roles=[role1])

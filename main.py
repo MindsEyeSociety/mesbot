@@ -158,6 +158,41 @@ class MyClient(discord.Client):
         cnx.commit()
         cursor.close()
 
+    @staticmethod
+    async def _remove_role_with_retry(member, role, attempts=3, delay=2.0):
+        """Remove ``role`` from ``member``, retrying transient Discord API errors.
+
+        Distinguishes the two failure modes the caller must report differently:
+        a permission failure (``discord.Forbidden`` — the bot can't manage the role, which
+        an admin has to fix) is returned immediately with no retry, while a transient API
+        failure (timeout / 5xx) is retried up to ``attempts`` times before giving up.
+        discord.py already retries 429 rate limits internally, so the ``HTTPException``s
+        that reach here are the ones worth re-attempting.
+
+        @param member: the guild member to remove the role from.
+        @param role: the role to remove.
+        @param attempts: total tries for transient errors (>= 1).
+        @param delay: seconds to wait between transient retries.
+        @returns "removed" on success, "forbidden" if the bot lacks permission (no retry),
+            or "api_error" if transient errors persisted through every attempt.
+
+        Example: await MyClient._remove_role_with_retry(member, role) -> "removed".
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                await member.remove_roles(role)
+                return "removed"
+            except discord.Forbidden:
+                return "forbidden"
+            except discord.HTTPException as e:
+                logger.warning(
+                    f"Transient Discord API error removing {role.name} from {member.id} "
+                    f"(attempt {attempt}/{attempts}): {e}"
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(delay)
+        return "api_error"
+
     @tasks.loop(hours=1) # run every hour
     async def daily_task(self):
         await self.wait_until_ready()  # Waits until the bot is connected
@@ -373,8 +408,8 @@ class MyClient(discord.Client):
                         elif action == "remove":
                             member = await guild.fetch_member(user_id)
                             if member:
-                                try:
-                                    await member.remove_roles(role)
+                                result = await self._remove_role_with_retry(member, role)
+                                if result == "removed":
                                     logger.info(f"Removed role {role.name} from user {user_id} in guild {guild.name}")
                                     await self.log_message(guild.id, f"Removed role {role.name} from {member.name}, as they have not validated their membership.")
                                     if user_id not in dm_notified:
@@ -383,15 +418,19 @@ class MyClient(discord.Client):
                                             await member.send(f"Your role '{role.name}' on '{guild.name}' has been removed as you have not validated your membership.")
                                         except:
                                             logger.error(f"Can't send removal PM to user {user_id}")
-                                    # Clear the flag only AFTER a successful removal, so a
-                                    # permissions failure keeps retrying without re-notifying.
+                                    # Clear the flag only AFTER a successful removal, so any
+                                    # failure keeps the flag and retries without re-notifying.
                                     cursor = get_cursor()
                                     cursor.execute("DELETE FROM unauthorized_users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
                                     cnx.commit()
                                     cursor.close()
-                                except (discord.Forbidden, discord.HTTPException) as e:
-                                    logger.error(f"Unable to remove {role.name} from user {user_id} on {guild.name}: {e}")
-                                    await self.log_message(guild.id, f"Unable to remove {role.name} from {member.name}. Please check permissions.")
+                                elif result == "forbidden":
+                                    # Admin-fixable: the bot can't manage this role. Report every run.
+                                    logger.error(f"Unable to remove {role.name} from user {user_id} on {guild.name}: bot lacks permission")
+                                    await self.log_message(guild.id, f"⚠️ Unable to remove {role.name} from {member.name}: the bot lacks the Manage Roles permission or its role is below {role.name}. An admin must fix the bot's permissions.")
+                                else:  # api_error — transient failures persisted through retries
+                                    logger.error(f"Failed to remove {role.name} from user {user_id} on {guild.name}: Discord API timed out after retries")
+                                    await self.log_message(guild.id, f"❌ Could not remove {role.name} from {member.name}: Discord API timed out after several attempts. Will retry on the next run.")
                             else:
                                 logger.warning(f"Unauthorized user {user_id} not found on server {guild.name}")
                 self._gate_mark_done('daily_maintenance')
