@@ -445,10 +445,12 @@ class MyClient(discord.Client):
             cursor.close()
 
             for guild_id, event_id, role_id in event_configs:
-                try:
-                    guild = await self.fetch_guild(guild_id)
-                except (discord.NotFound, discord.HTTPException):
-                    continue
+                # Read the guild and its members from the gateway-populated cache rather
+                # than the REST API. fetch_guild/fetch_member issue an HTTP request per
+                # attendee on every 60s pass, which saturates Discord's per-route rate
+                # limit as the attendee list grows; get_guild/get_member are in-memory
+                # lookups (no HTTP). Requires intents.members, which this bot enables.
+                guild = self.get_guild(guild_id)
                 if not guild:
                     continue
 
@@ -469,17 +471,18 @@ class MyClient(discord.Client):
                 cursor.close()
 
                 for discord_id in attendee_ids:
-                    try:
-                        member = await guild.fetch_member(discord_id)
-                    except (discord.NotFound, discord.HTTPException):
+                    # Skip attendees who are not in the guild (None) or already hold the
+                    # role — no REST call and no redundant add_roles, so a steady state
+                    # where everyone already has the role costs zero HTTP requests.
+                    member = guild.get_member(discord_id)
+                    if member is None or role in member.roles:
                         continue
-                    if member and role not in member.roles:
-                        try:
-                            await member.add_roles(role)
-                            await self.log_message(guild_id, f"✅ Assigned event role {role.name} to {member.display_name}.")
-                            logger.info(f"✅ Assigned event role {role.name} to {member.display_name} in {guild.name}")
-                        except (discord.Forbidden, discord.HTTPException) as e:
-                            logger.error(f"Failed to assign event role to {discord_id}: {e}")
+                    try:
+                        await member.add_roles(role)
+                        await self.log_message(guild_id, f"✅ Assigned event role {role.name} to {member.display_name}.")
+                        logger.info(f"✅ Assigned event role {role.name} to {member.display_name} in {guild.name}")
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        logger.error(f"Failed to assign event role to {discord_id}: {e}")
 
         except mysql.connector.Error as e:
             logger.critical(f"Fatal DB error in check_user_states, exiting: {e}")
@@ -999,5 +1002,6 @@ except mysql.connector.Error as err:
 
 #cursor=cnx.cursor()
 
-client = MyClient(intents=intents)
-client.run(os.getenv('TOKEN'))
+if __name__ == "__main__":
+    client = MyClient(intents=intents)
+    client.run(os.getenv('TOKEN'))
