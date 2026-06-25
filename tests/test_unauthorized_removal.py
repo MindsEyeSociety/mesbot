@@ -200,3 +200,31 @@ async def test_daily_task_flags_first_time_without_removing(fake_db, discord_fac
 
     member1.remove_roles.assert_not_awaited()
     assert any("INSERT INTO unauthorized_users" in s for s in fake_db.sql)
+
+
+# --- cross-DB membership-validation join guard ------------------------------------------
+
+async def test_membership_validation_joins_are_well_formed(fake_db, discord_factories):
+    """Pin the shape of the cross-database membership-validation joins.
+
+    The daily task validates membership by joining `user_authorizations.access_token` to
+    `mes-portal`.User.membershipNumber (Section A for expiry, Section B for self-heal). This
+    join is mission-critical and lives in inline SQL, so guard it against a silent refactor
+    that would break expiry detection. (The 2026-06 "empty join" incident turned out to be a
+    query-tool artifact, not a code defect — this locks the real code path regardless.)
+    """
+    guild = discord_factories.guild(G1, roles=[discord_factories.role(R1)])
+    guild.fetch_members = lambda: _aiter([])  # no members; only the validation queries run
+    client = _real_client()
+    client.fetch_guild = AsyncMock(return_value=guild)
+    fake_db.responses = {"FROM server_roles": [(G1, R1)]}
+
+    await main.MyClient.daily_task.coro(client)
+
+    joins = [s for s in fake_db.sql
+             if "user_authorizations ua" in s and "`mes-portal`.User u" in s]
+    assert joins, "no cross-DB membership-validation join was issued"
+    for query in joins:
+        assert "ua.access_token = u.membershipNumber" in query
+    # Section A keys expiry detection off membershipExpiration through that join.
+    assert any("membershipExpiration" in s and "`mes-portal`.User u" in s for s in fake_db.sql)
