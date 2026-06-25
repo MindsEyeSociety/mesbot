@@ -52,8 +52,14 @@ One MySQL server hosts **two databases**, queried together via cross-DB referenc
 - **`user_states`** — transient per-OAuth row `(state, user_id, guild_id, timestamp)`; also the work
   queue telling the bot "this user just verified — assign the role and welcome them in this guild."
 - `server_roles` (member role per guild), `server_event_roles` (`guild_id, event_id, role_id`),
-  `server_verification`, `server_logging`, `banned_users`, `unbanned_users`, `unauthorized_users`,
-  `daily_tasks`, `auth_messages`.
+  `server_verification`, `server_logging`, `banned_users`, `unbanned_users`, `unauthorized_users`
+  (`user_id, guild_id, notified_at` — per-guild grace flag for members holding the role without a
+  valid membership), `daily_tasks` (`task_name, last_run_date` — once-per-day gate per section),
+  `auth_messages`.
+- **`expired_members`** — audit log of lapsed memberships: `discord_user_id` (PK),
+  `membership_number`, `membership_expiration`, `recorded_at`. One row per user, refreshed each time
+  their membership is found expired (written by the daily task before it drops the authorization).
+  Auto-created on startup via `_ensure_schema` (the project has no migration system).
 
 ### Portal database `mes-portal` (read-mostly; owned by the Symfony membership portal)
 - `User` — `membershipNumber`, `emailAddress`, `firstName`, `lastName`, `membershipExpiration`,

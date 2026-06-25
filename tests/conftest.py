@@ -124,6 +124,7 @@ def _make_member(member_id, roles, display_name="Tester"):
     member.name = display_name
     member.roles = list(roles)
     member.add_roles = AsyncMock(name="add_roles")
+    member.remove_roles = AsyncMock(name="remove_roles")
     member.send = AsyncMock(name="send")
     return member
 

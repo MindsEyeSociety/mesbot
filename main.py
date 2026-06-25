@@ -50,6 +50,7 @@ class MyClient(discord.Client):
 
     async def setup_hook(self):
         """ Ensures tasks are started after the bot is ready """
+        self._ensure_schema()
         if not self.check_user_states.is_running():
             self.check_user_states.start()  # Start the background loop safely
             logger.info("✅ check_user_states loop started!")
@@ -57,6 +58,105 @@ class MyClient(discord.Client):
             self.daily_task.start()
             logger.info("✅ daily_task loop started!")
         await super().setup_hook()
+
+    def _ensure_schema(self):
+        """Create bot-owned tables that aren't part of the base schema, if missing.
+
+        Idempotent (CREATE TABLE IF NOT EXISTS), so it's safe to run on every startup;
+        this is how new bot tables ship since the project has no migration system. Currently
+        ensures `expired_members`, the audit log of memberships that have lapsed.
+
+        @see _record_expired_member
+        """
+        cursor = get_cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS expired_members (
+                discord_user_id BIGINT PRIMARY KEY,
+                membership_number VARCHAR(255),
+                membership_expiration DATE,
+                recorded_at DATETIME NOT NULL
+            )
+        """)
+        cnx.commit()
+        cursor.close()
+
+    def _record_expired_member(self, discord_user_id, membership_number, expiration_date):
+        """Record (audit) that a member's MES membership has lapsed.
+
+        Upserts one row per Discord user into `expired_members`, refreshed each time the
+        membership is found expired. Audit log only: it does not remove Discord roles (the
+        daily reconciliation does that). Voluntary `!expire` token removals are deliberately
+        NOT recorded here, since those are not membership expirations.
+
+        @param discord_user_id: the Discord user whose membership lapsed.
+        @param membership_number: their MES membership number (the stored access_token).
+        @param expiration_date: the membershipExpiration date that has now passed.
+
+        Example: self._record_expired_member(629679322210369537, "US2002023241", date(2025,2,1))
+        """
+        cursor = get_cursor()
+        cursor.execute("""
+            INSERT INTO expired_members (discord_user_id, membership_number, membership_expiration, recorded_at)
+            VALUES (%s, %s, %s, NOW())
+            ON DUPLICATE KEY UPDATE
+                membership_number = VALUES(membership_number),
+                membership_expiration = VALUES(membership_expiration),
+                recorded_at = NOW()
+        """, (discord_user_id, membership_number, expiration_date))
+        cnx.commit()
+        cursor.close()
+
+    @staticmethod
+    def _classify_unauthorized(existing_entry, now, grace_days=1):
+        """Decide what to do with a member who holds the role but isn't authorized.
+
+        Pure decision function (no I/O) so the per-guild cleanup policy is unit-testable in
+        isolation from Discord and the database.
+
+        @param existing_entry: the `unauthorized_users` row for THIS (user, guild) as a
+            (notified_at,) tuple, or None if not yet flagged in this guild.
+        @param now: current datetime, compared against notified_at.
+        @param grace_days: days to wait after first flagging before removing the role.
+        @returns "insert" to flag + notify, "wait" during the grace window, or "remove".
+
+        Example: MyClient._classify_unauthorized(None, datetime.datetime.now()) -> "insert".
+        """
+        if not existing_entry:
+            return "insert"
+        notified_at = existing_entry[0]
+        if (now - notified_at).days >= grace_days:
+            return "remove"
+        return "wait"
+
+    def _gate_should_run(self, task_name):
+        """Return True if the once-per-day task `task_name` has not completed today yet.
+
+        @param task_name: the `daily_tasks.task_name` key gating a section of daily work.
+        """
+        cursor = get_cursor()
+        cursor.execute("SELECT last_run_date FROM daily_tasks WHERE task_name = %s", (task_name,))
+        result = cursor.fetchone()
+        cursor.fetchall()
+        cursor.close()
+        last_run_date = result[0] if result else datetime.date.min
+        return last_run_date < datetime.date.today()
+
+    def _gate_mark_done(self, task_name):
+        """Mark `task_name` as completed today.
+
+        Call at the END of a section's work, so an interrupted run leaves the gate open and
+        retries on the next tick instead of being marked done before the work finished.
+
+        @param task_name: the `daily_tasks.task_name` key to stamp with today's date.
+        """
+        cursor = get_cursor()
+        cursor.execute("""
+            INSERT INTO daily_tasks (task_name, last_run_date)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE last_run_date = %s
+        """, (task_name, datetime.date.today(), datetime.date.today()))
+        cnx.commit()
+        cursor.close()
 
     @tasks.loop(hours=1) # run every hour
     async def daily_task(self):
@@ -116,37 +216,25 @@ class MyClient(discord.Client):
                                 logger.error(f"Error unbanning {user_id} in guild {guild.name}: {e}")
             cursor.close()
 
-            # check on membership expiration and notify users in 4 weeks, 2 weeks 1 week and upon expiration.
-            # expired members will lose their assigned role and be directed to the portal
-            last_run_date = datetime.date.min
-            cursor=get_cursor()
-            cursor.execute("SELECT last_run_date FROM daily_tasks WHERE task_name = 'daily_maintenance'")
-            result = cursor.fetchone()
-            cursor.fetchall()
-            if result:
-                last_run_date = result[0]
-            logger.info("Checking if we should run daily cleanup")
-            if last_run_date < datetime.date.today():
-                # hasn't been run, so let's run the stuff
-                logger.info(f"Running daily maintenance for {datetime.date.today()}")
-                # first we update the table to this doesn't run again
-                cursor.execute("""
-                    INSERT INTO daily_tasks (task_name, last_run_date)
-                    VALUES ('daily_maintenance', %s)
-                    ON DUPLICATE KEY UPDATE last_run_date = %s
-                """, (datetime.date.today(), datetime.date.today()))
-                cnx.commit()
-                # check for expired users and send them a notification
+            # --- Section A: membership-expiration notices + expired-member audit log ---
+            # Gated on its own daily key and marked done only on completion (see
+            # _gate_mark_done), so an interrupted run retries next tick rather than being
+            # marked done up front, while still not re-sending notices twice the same day.
+            if self._gate_should_run('expiration_notifications'):
+                logger.info(f"Running expiration notifications for {datetime.date.today()}")
+                cursor = get_cursor()
                 cursor.execute("""
                     SELECT ua.discord_user_id, ua.access_token, u.membershipExpiration
                     FROM user_authorizations ua
                     JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
                 """)
                 users = cursor.fetchall()
+                cursor.close()
                 today = datetime.datetime.today().date()
                 notify_days = [28,14,7,0] # notify at 4 weeks, 2 weeks, 1 week and day of expiration
                 for user in users:
                     user_id = user[0]
+                    membership_number = user[1]
                     expiration_date = user[2]
 
                     if expiration_date is None:
@@ -166,16 +254,32 @@ class MyClient(discord.Client):
                             logger.error(f"Could not send message to user {user_id}.")
 
                     if days_until_expiration < 0:
-                        # Expired membership: Remove from user_authorizations
+                        # Expired: record it (audit) BEFORE dropping the authorization.
+                        self._record_expired_member(user_id, membership_number, expiration_date)
+                        cursor = get_cursor()
                         cursor.execute("DELETE FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
                         cnx.commit()
-                        logger.info(f"Removed expired user {user_id} from user_authorizations.")
+                        cursor.close()
+                        logger.info(f"Recorded and removed expired user {user_id} from user_authorizations.")
 
-                # step 2 check server roles and unauthorized users
+                self._gate_mark_done('expiration_notifications')
+                logger.info("Expiration notifications complete.")
+            else:
+                logger.info("Skipping expiration notifications, already complete today.")
+
+            # --- Section B: member-role reconciliation + unauthorized-role cleanup ---
+            # Idempotent, so marking it done only on completion lets an interrupted run retry.
+            if self._gate_should_run('daily_maintenance'):
+                logger.info(f"Running daily maintenance for {datetime.date.today()}")
+                cursor = get_cursor()
                 cursor.execute("SELECT guild_id, role_id FROM server_roles")
-                servers=cursor.fetchall()
+                servers = cursor.fetchall()
+                cursor.close()
 
-                notified_users = set()
+                # Dedupe only the outbound DMs across guilds in this run; the per-guild role
+                # work below always runs, so a member is reconciled in EVERY server they're in
+                # rather than only the first one encountered.
+                dm_notified = set()
 
                 for server in servers:
                     guild_id = server[0]
@@ -203,6 +307,7 @@ class MyClient(discord.Client):
                     # safety net for the per-OAuth assignment path in check_user_states — if that
                     # path is ever interrupted, the daily run reconciles from user_authorizations.
                     # Silent on purpose: no welcome DMs/channel posts during a bulk reconcile.
+                    cursor = get_cursor()
                     cursor.execute("""
                         SELECT ua.discord_user_id
                         FROM user_authorizations ua
@@ -210,6 +315,7 @@ class MyClient(discord.Client):
                         WHERE u.membershipExpiration >= CURDATE()
                     """)
                     valid_authorized = {row[0] for row in cursor.fetchall()}
+                    cursor.close()
                     for member in members:
                         if member.id in valid_authorized and role not in member.roles:
                             try:
@@ -223,77 +329,75 @@ class MyClient(discord.Client):
 
                     logger.info(f"Users with {role_id} are {users_with_role}")
                     for user_id in users_with_role:
-                        if user_id in notified_users:
-                            continue # skip if the user has already been notified
-                        notified_users.add(user_id)
-                        logger.info(f"{user_id}")
-                        discord_user = await self.fetch_user(user_id)
-                        #print(f"Searching for user {discord_user.name} with id {user_id} in authorizations")
-                        cursor.execute("SELECT * FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
+                        cursor = get_cursor()
+                        cursor.execute("SELECT 1 FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
                         is_authorized = cursor.fetchone()
-                        cursor.fetchall()  # Clear unread results
+                        cursor.fetchall()
+                        cursor.close()
+                        if is_authorized:
+                            continue
 
-                        if not is_authorized:
-                            # check if they were notified already
-                            #print(f"User {discord_user.name} with id {user_id} not found in authorizations")
-                            #await self.log_message(guild.id,f"User {discord_user.name} with id {user_id} not found in authorizations")
-                            cursor.execute("SELECT notified_at FROM unauthorized_users WHERE user_id = %s", (user_id,))
-                            existing_entry = cursor.fetchone()
-                            cursor.fetchall() # clear the results
-                            if not existing_entry:
-                                # insert into the table
-                                cursor.execute("""
-                                    INSERT INTO unauthorized_users (user_id, guild_id, notified_at)
-                                    VALUES (%s, %s, NOW())
-                                """, (user_id, guild_id))
-                                cnx.commit()
-                                logger.info(f"Logged unauthorized user {discord_user.name} with id {user_id} in guild {guild.name} to unauthorized users table.")
-                                await self.log_message(guild.id,f"User {discord_user.name} with id {user_id} has role {role.name} but has not verified.")
-                                # don't notify yet
-                                member = await guild.fetch_member(user_id)
-                                if member:
-                                    try:
-                                        logger.info(f"Sending notification to {member.name}")
-                                        await self.log_message(guild.id, f"Sending notification to {member.name} to get a token.")
-                                        await member.send(f"Please follow the steps provided to validate your membership.")
-                                        await self.on_member_join(member)
-                                    except:
-                                        await self.log_message(guild.id, f"Can't send PM to user {member.name}")
-                                        logger.error(f"Can't send PM to user {member.name}")
-                                else:
-                                    logger.warning(f"Member {user_id} not found in {guild.name}")
-                            else:
-                                notified_at = existing_entry[0]
-                                #print(f"User {discord_user.name} already notified on {notified_at}")
-                                if (datetime.datetime.now() - notified_at).days >= 1:
-                                    # remove role if notified at least 7 days ago
-                                    member = await guild.fetch_member(user_id)
-                                    if member:
-                                        # don't do anything yet just log what it would do
-                                        try:
-                                            await member.remove_roles(role)
-                                        except:
-                                            logger.error(f"Unable to remove {role.name} from user {user_id} on {guild.name}")
-                                            await self.log_message(guild.id, f"Unable to remove {role.name} from user {member.name}. Please check permissions.")
+                        # Unauthorized in THIS guild. Look up the guild-scoped flag (NOT just
+                        # by user_id) and decide independently per guild, so a member in
+                        # several servers is cleaned up in each one.
+                        cursor = get_cursor()
+                        cursor.execute(
+                            "SELECT notified_at FROM unauthorized_users WHERE user_id = %s AND guild_id = %s",
+                            (user_id, guild_id)
+                        )
+                        existing_entry = cursor.fetchone()
+                        cursor.fetchall()
+                        cursor.close()
+
+                        action = self._classify_unauthorized(existing_entry, datetime.datetime.now())
+
+                        if action == "insert":
+                            cursor = get_cursor()
+                            cursor.execute("""
+                                INSERT INTO unauthorized_users (user_id, guild_id, notified_at)
+                                VALUES (%s, %s, NOW())
+                            """, (user_id, guild_id))
+                            cnx.commit()
+                            cursor.close()
+                            logger.info(f"Logged unauthorized user {user_id} in guild {guild.name}.")
+                            await self.log_message(guild.id, f"User {user_id} has role {role.name} but has not verified.")
+                            member = await guild.fetch_member(user_id)
+                            if member and user_id not in dm_notified:
+                                dm_notified.add(user_id)  # at most one "please validate" DM per run
+                                try:
+                                    await member.send("Please follow the steps provided to validate your membership.")
+                                    await self.on_member_join(member)
+                                except:
+                                    await self.log_message(guild.id, f"Can't send PM to user {member.name}")
+                                    logger.error(f"Can't send PM to user {user_id}")
+                        elif action == "remove":
+                            member = await guild.fetch_member(user_id)
+                            if member:
+                                try:
+                                    await member.remove_roles(role)
+                                    logger.info(f"Removed role {role.name} from user {user_id} in guild {guild.name}")
+                                    await self.log_message(guild.id, f"Removed role {role.name} from {member.name}, as they have not validated their membership.")
+                                    if user_id not in dm_notified:
+                                        dm_notified.add(user_id)
                                         try:
                                             await member.send(f"Your role '{role.name}' on '{guild.name}' has been removed as you have not validated your membership.")
-                                            logger.info(f"Removed role {role.name} from user {user_id} in guild {guild_id}")
-                                            await self.log_message(guild.id,f"Removed role {role.name} from user {member.name}, as they have not validated their membership, notifed user on {notified_at}")
                                         except:
-                                            await self.log_message(guild.id, f"Can't send PM to user {member.name}")
-                                            logger.error(f"Can't send PM to user {member.name}")
-
-                                        # remove entry from unauthorized_users
-
-                                        cursor.execute("DELETE FROM unauthorized_users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
-                                        cnx.commit()
-                                    else:
-                                        logger.warning(f"Unable to find {member.name} on server {guild.name}")
-                                        await self.log_message(guild.id, f"Unable to find {member.name} on this server.")
+                                            logger.error(f"Can't send removal PM to user {user_id}")
+                                    # Clear the flag only AFTER a successful removal, so a
+                                    # permissions failure keeps retrying without re-notifying.
+                                    cursor = get_cursor()
+                                    cursor.execute("DELETE FROM unauthorized_users WHERE user_id = %s AND guild_id = %s", (user_id, guild_id))
+                                    cnx.commit()
+                                    cursor.close()
+                                except (discord.Forbidden, discord.HTTPException) as e:
+                                    logger.error(f"Unable to remove {role.name} from user {user_id} on {guild.name}: {e}")
+                                    await self.log_message(guild.id, f"Unable to remove {role.name} from {member.name}. Please check permissions.")
+                            else:
+                                logger.warning(f"Unauthorized user {user_id} not found on server {guild.name}")
+                self._gate_mark_done('daily_maintenance')
                 logger.info("Daily task complete.")
             else:
                 logger.info("Skipping daily task, already complete.")
-            cursor.close()
         except mysql.connector.Error as e:
             logger.critical(f"Fatal DB error in daily_task, exiting: {e}")
             os._exit(1)
