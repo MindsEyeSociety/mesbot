@@ -613,6 +613,19 @@ class MyClient(discord.Client):
                 attendee_ids = [row[0] for row in cursor.fetchall()]
                 cursor.close()
 
+                # Some qualifying attendees may be in the guild but absent from the member
+                # cache — e.g. they joined before registering (so on_member_join couldn't
+                # assign yet) or their join was missed around a gateway reconnect. Refresh
+                # those over the gateway (NOT REST), so they get picked up without
+                # reintroducing the per-attendee REST scan. IDs not in the guild are simply
+                # not returned, and a fully-cached steady state makes zero gateway calls.
+                uncached = [d for d in attendee_ids if guild.get_member(d) is None]
+                for i in range(0, len(uncached), 100):  # query_members allows <=100 ids/call
+                    try:
+                        await guild.query_members(user_ids=uncached[i:i + 100], cache=True)
+                    except (discord.HTTPException, asyncio.TimeoutError) as e:
+                        logger.warning(f"query_members failed for {len(uncached[i:i + 100])} ids in {guild.name}: {e}")
+
                 for discord_id in attendee_ids:
                     # Skip attendees who are not in the guild (None) or already hold the
                     # role — no REST call and no redundant add_roles, so a steady state

@@ -138,6 +138,8 @@ def _make_guild(guild_id, roles, name="Test Guild"):
     # event scan must NOT use — kept here so tests can assert it is never called.
     guild.get_member = MagicMock(name="get_member")
     guild.fetch_member = AsyncMock(name="fetch_member")
+    # query_members is the gateway cache-refresh the scan uses for cache misses.
+    guild.query_members = AsyncMock(name="query_members")
     return guild
 
 
