@@ -88,3 +88,19 @@ async def test_daily_task_stamps_heartbeat_on_completion():
     fake = types.SimpleNamespace(_daily_task_once=AsyncMock(), wait_until_ready=AsyncMock())
     await main.MyClient.daily_task.coro(fake)
     assert isinstance(fake._daily_last_ok, float)
+
+
+async def test_heartbeat_is_stamped_before_the_body_runs():
+    # Blind-spot regression: the heartbeat must advance at the START of a pass. Otherwise a body
+    # that hangs without ever completing leaves the heartbeat None, and the watchdog's None-guard
+    # ignores it forever (this let a real stall persist for hours). Capture the heartbeat from
+    # inside the body to prove it was already set when the body began.
+    fake = types.SimpleNamespace()
+    seen = {}
+
+    async def body():
+        seen["hb"] = getattr(fake, "_cus_last_ok", None)
+
+    fake._check_user_states_once = body
+    await main.MyClient.check_user_states.coro(fake)
+    assert seen["hb"] is not None
