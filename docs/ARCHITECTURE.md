@@ -19,6 +19,12 @@ MESBot is two Python processes that share a database:
   the global ban/unban lists, sends membership-expiration reminders, removes the role from unverified
   members after a grace period, and self-heals the member role (grants it to any verified, valid member
   who is missing it).
+- **`loop_watchdog`** — `@tasks.loop(seconds=60)`. Resilience backstop. Each of the two loops above wraps
+  its body in `asyncio.wait_for` (cancels a cancellable async hang and retries next tick) and stamps a
+  `time.monotonic()` heartbeat after every pass. The watchdog `os._exit(1)`s (→ supervisor restart) if a
+  heartbeat goes stale past its limit (`CHECK_USER_STATES_STALL_LIMIT` / `DAILY_TASK_STALL_LIMIT`) —
+  catching the cases `wait_for` can't (a non-cancellable block or a stopped loop) so role assignment can
+  never silently freeze for hours.
 
 ## Deployment
 

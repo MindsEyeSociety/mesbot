@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 CHECK_USER_STATES_TIMEOUT = 50
 DAILY_TASK_TIMEOUT = 600
 
+# Watchdog backstop. The per-iteration wait_for above only cancels *cancellable* async hangs; a
+# non-cancellable block or a fully-stopped loop slips past it and silently halts role assignment
+# for hours (observed repeatedly). Each loop stamps a monotonic heartbeat after every pass; if a
+# heartbeat goes stale past these limits, the watchdog os._exit's and supervisor restarts the bot.
+# Limits sit well above a normal pass (scan ticks every 60s; daily ticks hourly, heartbeating even
+# when gated).
+CHECK_USER_STATES_STALL_LIMIT = 240
+DAILY_TASK_STALL_LIMIT = 5400
+
 
 def get_cursor():
     """Return a DB cursor, reconnecting the global connection if it went stale.
@@ -65,7 +74,44 @@ class MyClient(discord.Client):
         if not self.daily_task.is_running():
             self.daily_task.start()
             logger.info("✅ daily_task loop started!")
+        if not self.loop_watchdog.is_running():
+            self.loop_watchdog.start()
+            logger.info("✅ loop_watchdog loop started!")
         await super().setup_hook()
+
+    def _loops_stalled(self, now):
+        """Return True if a monitored background loop has stopped heartbeating past its limit.
+
+        Pure (no I/O) so the watchdog's restart decision is unit-testable. Each loop stamps a
+        ``time.monotonic()`` heartbeat after every pass; a loop that hangs uncancellably or stops
+        leaves its heartbeat stale. A loop that has not completed its first pass yet (heartbeat
+        ``None``) is never considered stalled, so the watchdog can't restart-loop the process at
+        boot.
+
+        @param now: current ``time.monotonic()`` value.
+
+        Example: ``self._loops_stalled(time.monotonic())`` → ``False`` in steady state, ``True``
+        once the scan's heartbeat is older than ``CHECK_USER_STATES_STALL_LIMIT``.
+        """
+        for attr, limit in (("_cus_last_ok", CHECK_USER_STATES_STALL_LIMIT),
+                            ("_daily_last_ok", DAILY_TASK_STALL_LIMIT)):
+            last = getattr(self, attr, None)
+            if last is not None and now - last > limit:
+                return True
+        return False
+
+    @tasks.loop(seconds=60)
+    async def loop_watchdog(self):
+        """Restart the process if a background loop has stalled past its limit.
+
+        The per-iteration ``wait_for`` handles cancellable async hangs; this catches the rest — a
+        non-cancellable block or a fully-stopped loop, which leave the heartbeat stale. The body is
+        deliberately trivial (no Discord/DB awaits) so the watchdog itself can't hang; the event
+        loop stays alive during these stalls (the gateway keeps resuming), so it fires reliably.
+        """
+        if self._loops_stalled(time.monotonic()):
+            logger.critical("Background loop stalled past its limit; exiting for supervisor restart.")
+            os._exit(1)
 
     def _ensure_schema(self):
         """Create bot-owned tables that aren't part of the base schema, if missing.
@@ -208,6 +254,7 @@ class MyClient(discord.Client):
             await asyncio.wait_for(self._daily_task_once(), timeout=DAILY_TASK_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(f"daily_task stalled >{DAILY_TASK_TIMEOUT}s; iteration cancelled, retrying next tick")
+        self._daily_last_ok = time.monotonic()  # watchdog heartbeat
 
     async def _daily_task_once(self):
         try:
@@ -463,6 +510,7 @@ class MyClient(discord.Client):
             await asyncio.wait_for(self._check_user_states_once(), timeout=CHECK_USER_STATES_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(f"check_user_states stalled >{CHECK_USER_STATES_TIMEOUT}s; iteration cancelled, retrying next tick")
+        self._cus_last_ok = time.monotonic()  # watchdog heartbeat: a pass ran (completed or timed-out)
 
     async def _check_user_states_once(self):
         try:
