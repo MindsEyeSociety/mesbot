@@ -249,12 +249,12 @@ class MyClient(discord.Client):
 
     @tasks.loop(hours=1) # run every hour
     async def daily_task(self):
+        self._daily_last_ok = time.monotonic()  # heartbeat at pass start (see check_user_states)
         await self.wait_until_ready()  # Waits until the bot is connected
         try:
             await asyncio.wait_for(self._daily_task_once(), timeout=DAILY_TASK_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(f"daily_task stalled >{DAILY_TASK_TIMEOUT}s; iteration cancelled, retrying next tick")
-        self._daily_last_ok = time.monotonic()  # watchdog heartbeat
 
     async def _daily_task_once(self):
         try:
@@ -506,11 +506,16 @@ class MyClient(discord.Client):
 
     @tasks.loop(seconds=60) # run every 60 seconds
     async def check_user_states(self):
+        # Heartbeat at the START of the pass, not the end. If the body hangs in a way wait_for
+        # can't cancel (so the wrapper never returns), the heartbeat still advanced when the pass
+        # began — it then goes stale and the watchdog fires. Stamping only after a *completed*
+        # pass left the very first pass's hang invisible (heartbeat stayed None, so the watchdog's
+        # None-guard ignored it), which let a stall persist for hours.
+        self._cus_last_ok = time.monotonic()
         try:
             await asyncio.wait_for(self._check_user_states_once(), timeout=CHECK_USER_STATES_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(f"check_user_states stalled >{CHECK_USER_STATES_TIMEOUT}s; iteration cancelled, retrying next tick")
-        self._cus_last_ok = time.monotonic()  # watchdog heartbeat: a pass ran (completed or timed-out)
 
     async def _check_user_states_once(self):
         try:
