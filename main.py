@@ -23,6 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Max wall-clock for a single background-loop iteration. If a Discord await hangs (e.g. during
+# a gateway reconnect), wait_for cancels the iteration so the loop self-recovers on its next
+# tick instead of freezing forever. CHECK is below the 60s interval so a hung pass is cancelled
+# before the next tick; DAILY is generous because that pass legitimately fetches members across
+# every guild.
+CHECK_USER_STATES_TIMEOUT = 50
+DAILY_TASK_TIMEOUT = 600
+
 
 def get_cursor():
     """Return a DB cursor, reconnecting the global connection if it went stale.
@@ -197,6 +205,12 @@ class MyClient(discord.Client):
     async def daily_task(self):
         await self.wait_until_ready()  # Waits until the bot is connected
         try:
+            await asyncio.wait_for(self._daily_task_once(), timeout=DAILY_TASK_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"daily_task stalled >{DAILY_TASK_TIMEOUT}s; iteration cancelled, retrying next tick")
+
+    async def _daily_task_once(self):
+        try:
             # check the banlist
             cursor=get_cursor()
             cursor.execute("SELECT user_id FROM banned_users")
@@ -285,7 +299,7 @@ class MyClient(discord.Client):
                             if discord_user:
                                 await discord_user.send(f"🔔 Your membership will expire on {expiration_date}.")
                                 logger.info(f"Notified user {user_id} about membership expiration on {expiration_date}.")
-                        except:
+                        except Exception:
                             logger.error(f"Could not send message to user {user_id}.")
 
                     if days_until_expiration < 0:
@@ -402,7 +416,7 @@ class MyClient(discord.Client):
                                 try:
                                     await member.send("Please follow the steps provided to validate your membership.")
                                     await self.on_member_join(member)
-                                except:
+                                except Exception:
                                     await self.log_message(guild.id, f"Can't send PM to user {member.name}")
                                     logger.error(f"Can't send PM to user {user_id}")
                         elif action == "remove":
@@ -416,7 +430,7 @@ class MyClient(discord.Client):
                                         dm_notified.add(user_id)
                                         try:
                                             await member.send(f"Your role '{role.name}' on '{guild.name}' has been removed as you have not validated your membership.")
-                                        except:
+                                        except Exception:
                                             logger.error(f"Can't send removal PM to user {user_id}")
                                     # Clear the flag only AFTER a successful removal, so any
                                     # failure keeps the flag and retries without re-notifying.
@@ -445,6 +459,12 @@ class MyClient(discord.Client):
 
     @tasks.loop(seconds=60) # run every 60 seconds
     async def check_user_states(self):
+        try:
+            await asyncio.wait_for(self._check_user_states_once(), timeout=CHECK_USER_STATES_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error(f"check_user_states stalled >{CHECK_USER_STATES_TIMEOUT}s; iteration cancelled, retrying next tick")
+
+    async def _check_user_states_once(self):
         try:
             cursor=get_cursor()
 
@@ -521,7 +541,7 @@ class MyClient(discord.Client):
                                 await member.send(f"✅ You've been assigned the role '{role.name}' on {guild.name} automatically.")
                                 logger.info(f"✅ Assigned role {role.name} to {member.display_name} in {guild.name}")
                                 await self.log_message(guild_id, f"✅ Assigned role {role.name} to {member.display_name}.")
-                            except:
+                            except Exception:
                                 logger.error(f"Error assigning role {role.name} to {member.display_name} in {guild.name}")
                                 await self.log_message(guild_id, f"Error assigning role {role.name} to {member.display_name}. Please check bot permissions.")
                         else:
@@ -559,7 +579,7 @@ class MyClient(discord.Client):
                     msg_result = cursor.fetchone()
                     cursor.fetchall()
                     cursor.close()
-                except:
+                except Exception:
                     logger.error(f"Error updating expired link in message {state}")
                 if msg_result:
                     message_id = msg_result[0]
@@ -579,7 +599,7 @@ class MyClient(discord.Client):
                     cursor.execute("DELETE FROM auth_messages where state = %s", (state,))
                     cnx.commit()
                     cursor.close()
-                except:
+                except Exception:
                     logger.error(f"Error removing {state} from auth_messages")
             # --- Event role periodic scan ---
             cursor = get_cursor()
@@ -686,7 +706,7 @@ class MyClient(discord.Client):
                         try:
                             member = await guild.fetch_member(message.author.id)
                             await self.on_member_join(member)
-                        except:
+                        except Exception:
                             await message.reply(f"❌ You are not a member of {guild.name}")
                             logger.warning(f"Unable to find member {message.author.id} on server {guild.name}")
 
@@ -698,7 +718,7 @@ class MyClient(discord.Client):
                     cursor.execute("DELETE FROM user_authorizations WHERE discord_user_id = %s", (user_id,))
                     cnx.commit()
                     await message.reply("✅ Token removed, please use !auth to get a new token.")
-                except:
+                except Exception:
                     await message.reply("❌ Token not found.")
                 cursor.close()
                 return
