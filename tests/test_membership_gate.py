@@ -26,7 +26,7 @@ async def test_attendee_query_enforces_valid_membership(fake_db, discord_factori
         "EventAttendee": [(DISCORD_ID,)],
     }
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     attendee_queries = [s for s in fake_db.sql if "EventAttendee" in s]
     assert attendee_queries, "scan never queried EventAttendee"

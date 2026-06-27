@@ -82,7 +82,7 @@ async def test_daily_task_strips_unauthorized_in_every_guild(fake_db, discord_fa
         # everything else (auth checks, expiry scan, gates) defaults to empty
     }
 
-    await main.MyClient.daily_task.coro(client)
+    await main.MyClient._daily_task_once(client)
 
     # Removed in BOTH servers — the old shared-dedup bug would have skipped the second.
     member1.remove_roles.assert_awaited_once_with(role1)
@@ -112,7 +112,7 @@ async def test_daily_task_waits_within_grace_period(fake_db, discord_factories):
         "notified_at FROM unauthorized_users": [(five_hours_ago,)],
     }
 
-    await main.MyClient.daily_task.coro(client)
+    await main.MyClient._daily_task_once(client)
 
     member1.remove_roles.assert_not_awaited()  # still inside the grace window
 
@@ -134,7 +134,7 @@ async def test_daily_task_forbidden_keeps_flag_and_reports_permissions(fake_db, 
         "notified_at FROM unauthorized_users": [(two_days_ago,)],
     }
 
-    await main.MyClient.daily_task.coro(client)
+    await main.MyClient._daily_task_once(client)
 
     member1.remove_roles.assert_awaited_once()  # no retry on a permission error
     # Flag is kept (no DELETE) so it retries and re-reports next run.
@@ -196,7 +196,7 @@ async def test_daily_task_flags_first_time_without_removing(fake_db, discord_fac
         # no unauthorized_users row yet -> first-time flag, no removal
     }
 
-    await main.MyClient.daily_task.coro(client)
+    await main.MyClient._daily_task_once(client)
 
     member1.remove_roles.assert_not_awaited()
     assert any("INSERT INTO unauthorized_users" in s for s in fake_db.sql)
@@ -219,7 +219,7 @@ async def test_membership_validation_joins_are_well_formed(fake_db, discord_fact
     client.fetch_guild = AsyncMock(return_value=guild)
     fake_db.responses = {"FROM server_roles": [(G1, R1)]}
 
-    await main.MyClient.daily_task.coro(client)
+    await main.MyClient._daily_task_once(client)
 
     joins = [s for s in fake_db.sql
              if "user_authorizations ua" in s and "`mes-portal`.User u" in s]

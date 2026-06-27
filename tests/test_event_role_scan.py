@@ -37,7 +37,7 @@ async def test_scan_assigns_role_to_cached_attendee(fake_db, discord_factories):
     member = discord_factories.member(DISCORD_ID, roles=[])  # in guild, lacks role
     role, guild, client = _wire(fake_db, discord_factories, member=member)
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_awaited_once_with(role)
     client.log_message.assert_awaited()
@@ -50,7 +50,7 @@ async def test_scan_is_idempotent_when_role_present(fake_db, discord_factories):
     role, guild, client = _wire(fake_db, discord_factories, member=member)
     member.roles = [role]  # already holds the role
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_not_awaited()
     guild.fetch_member.assert_not_called()
@@ -63,7 +63,7 @@ async def test_scan_skips_attendee_not_in_guild(fake_db, discord_factories):
     member = discord_factories.member(DISCORD_ID, roles=[])
     role, guild, client = _wire(fake_db, discord_factories, member=member, in_guild=False)
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_not_awaited()
     guild.fetch_member.assert_not_called()
@@ -73,7 +73,7 @@ async def test_scan_no_configured_events_does_nothing(fake_db, discord_factories
     client = discord_factories.client()
     fake_db.responses = {}  # server_event_roles query yields no rows
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     client.get_guild.assert_not_called()
 
@@ -104,7 +104,7 @@ async def test_scan_queries_then_assigns_uncached_in_guild_attendee(fake_db, dis
         "EventAttendee": [(DISCORD_ID,)],
     }
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     guild.query_members.assert_awaited_once()
     assert DISCORD_ID in guild.query_members.await_args.kwargs["user_ids"]
@@ -128,7 +128,7 @@ async def test_scan_skips_uncached_not_in_guild_after_query(fake_db, discord_fac
         "EventAttendee": [(DISCORD_ID,)],
     }
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     guild.query_members.assert_awaited_once()
     member.add_roles.assert_not_awaited()
@@ -140,7 +140,7 @@ async def test_scan_cached_attendee_makes_no_gateway_call(fake_db, discord_facto
     member = discord_factories.member(DISCORD_ID, roles=[])
     role, guild, client = _wire(fake_db, discord_factories, member=member)
 
-    await main.MyClient.check_user_states.coro(client)
+    await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_awaited_once_with(role)
     guild.query_members.assert_not_awaited()
