@@ -154,6 +154,9 @@ def _make_client():
     client.fetch_user = AsyncMock(name="fetch_user")
     client.get_ver_channel = AsyncMock(name="get_ver_channel", return_value=None)
     client.log_message = AsyncMock(name="log_message")
+    # The event scan announces grants publicly; a no-op here keeps cache-hit scan tests (which
+    # use this fake self) awaitable without exercising the real announcement.
+    client._announce_event_role = AsyncMock(name="_announce_event_role")
     return client
 
 
