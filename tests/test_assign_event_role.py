@@ -5,6 +5,8 @@ who registered *before* joining the server. It mirrors the periodic scan's logic
 (same EventAttendee + valid-membership gate, same idempotent add_roles), so its
 behavior matrix is asserted directly here.
 """
+from unittest.mock import AsyncMock, MagicMock
+
 import discord
 import main
 
@@ -19,6 +21,13 @@ def _member_with_guild(discord_factories, role, *, member_roles):
     member = discord_factories.member(MEMBER_ID, roles=member_roles)
     member.guild = guild
     return member
+
+
+def _real_client():
+    """A real MyClient (so _announce_event_role is the real one) with log I/O stubbed."""
+    client = main.MyClient(intents=discord.Intents.none())
+    client.log_message = AsyncMock()
+    return client
 
 
 async def test_assign_no_config_returns_early(fake_db, discord_factories):
@@ -56,6 +65,28 @@ async def test_assign_grants_role_to_attendee(fake_db, discord_factories):
 
     member.add_roles.assert_awaited_once_with(role)
     client.log_message.assert_awaited()
+    client._announce_event_role.assert_awaited_once()  # public announcement on grant
+
+
+async def test_assign_announces_in_verification_channel(fake_db, discord_factories):
+    # On-join grant posts the public "paid attendee" note to the verification channel.
+    role = discord_factories.role(ROLE_ID)
+    member = _member_with_guild(discord_factories, role, member_roles=[])
+    member.mention = f"<@{MEMBER_ID}>"
+    ver_channel = MagicMock(name="arrivals")
+    ver_channel.send = AsyncMock()
+    member.guild.get_channel = MagicMock(return_value=ver_channel)
+    client = _real_client()
+    fake_db.responses = {
+        "server_event_roles": [(EVENT_ID, ROLE_ID)],
+        "EventAttendee": [(1,)],
+        "server_verification": [(999,)],
+    }
+
+    await main.MyClient.assign_event_role(client, member)
+
+    member.add_roles.assert_awaited_once_with(role)
+    ver_channel.send.assert_awaited_once()
 
 
 async def test_assign_skips_non_attendee(fake_db, discord_factories):

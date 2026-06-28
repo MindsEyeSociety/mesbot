@@ -63,6 +63,7 @@ async def test_scan_assigns_role_to_cached_attendee(fake_db, discord_factories):
 
     member.add_roles.assert_awaited_once_with(role)
     client.log_message.assert_awaited()
+    client._announce_event_role.assert_awaited_once()  # public announcement on grant
     guild.fetch_member.assert_not_called()    # cache hit — no REST
     guild.query_members.assert_not_called()   # never the chunk-colliding path
 
@@ -75,6 +76,7 @@ async def test_scan_is_idempotent_when_role_present(fake_db, discord_factories):
     await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_not_awaited()
+    client._announce_event_role.assert_not_awaited()  # nothing granted -> no announcement
     guild.fetch_member.assert_not_called()
 
 
@@ -144,3 +146,45 @@ async def test_fetch_attendee_absent_is_cached_then_skipped(discord_factories):
     assert await main.MyClient._fetch_attendee(client, guild, GUILD_ID, DISCORD_ID) is None
 
     guild.fetch_member.assert_awaited_once()  # second call short-circuited by the negative cache
+
+
+# --- public announcement on grant (#arrivals / verification channel) --------------------
+
+async def test_scan_announces_in_verification_channel_on_assignment(fake_db, discord_factories):
+    # On a real grant the scan posts a public note to the verification channel.
+    role = discord_factories.role(ROLE_ID)
+    member = discord_factories.member(DISCORD_ID, roles=[])
+    member.mention = f"<@{DISCORD_ID}>"
+    guild = discord_factories.guild(GUILD_ID, roles=[role])
+    guild.get_member = MagicMock(return_value=member)
+    ver_channel = MagicMock(name="arrivals")
+    ver_channel.send = AsyncMock()
+    guild.get_channel = MagicMock(return_value=ver_channel)
+    client = _real_client()
+    client.get_guild = MagicMock(return_value=guild)
+    fake_db.responses = {
+        "server_event_roles": [(GUILD_ID, EVENT_ID, ROLE_ID)],
+        "EventAttendee": [(DISCORD_ID,)],
+        "server_verification": [(999,)],  # get_ver_channel -> this channel
+    }
+
+    await main.MyClient._check_user_states_once(client)
+
+    member.add_roles.assert_awaited_once_with(role)
+    ver_channel.send.assert_awaited_once()
+
+
+async def test_announce_event_role_silent_without_verification_channel(fake_db, discord_factories):
+    # No verification channel configured -> get_ver_channel returns None -> no public post.
+    client = _real_client()
+    member = discord_factories.member(DISCORD_ID, roles=[])
+    member.mention = f"<@{DISCORD_ID}>"
+    guild = discord_factories.guild(GUILD_ID, roles=[])
+    ver_channel = MagicMock()
+    ver_channel.send = AsyncMock()
+    guild.get_channel = MagicMock(return_value=ver_channel)
+    fake_db.responses = {}  # server_verification empty -> get_ver_channel None
+
+    await main.MyClient._announce_event_role(client, guild, member, discord_factories.role(ROLE_ID))
+
+    ver_channel.send.assert_not_awaited()
