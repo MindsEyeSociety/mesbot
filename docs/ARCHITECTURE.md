@@ -94,6 +94,15 @@ One MySQL server hosts **two databases**, queried together via cross-DB referenc
 registered for the event, matching `EventAttendee.user_id` (preferred) or `membershipNumberSubmitted`,
 with a current membership. Applied on join (`assign_event_role`) and in the 60s event scan.
 
+> **Important — member resolution in the scan:** the scan reads members from the gateway cache
+> (`get_member`, zero HTTP). On a cache miss it falls back to a single `fetch_member` (REST),
+> throttled by a per-`(guild, user)` negative cache (`_fetch_attendee` / `EVENT_ABSENT_TTL`) so
+> not-in-guild attendees aren't re-fetched every pass — that repeated REST was a 429 storm.
+> **Never use `guild.query_members` here:** it shares discord.py's chunk-request machinery and
+> deadlocks against the gateway's automatic guild re-chunking (startup + every reconnect), which
+> froze the whole loop for hours. Reproduced: concurrent `query_members` + `chunk()` on one guild
+> reliably hangs.
+
 ## Zeffy → event-role pipeline
 
 Ticket data is **pushed**, not pulled:
