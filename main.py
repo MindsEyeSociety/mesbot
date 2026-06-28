@@ -2,6 +2,7 @@
 
 import time
 import asyncio
+import io
 import logging
 from discord.ext import tasks
 import uuid
@@ -110,7 +111,16 @@ class MyClient(discord.Client):
         loop stays alive during these stalls (the gateway keeps resuming), so it fires reliably.
         """
         if self._loops_stalled(time.monotonic()):
-            logger.critical("Background loop stalled past its limit; exiting for supervisor restart.")
+            logger.critical("Background loop stalled past its limit; dumping task stacks before restart.")
+            # Diagnostic: dump every asyncio task's suspended stack so the log shows the exact
+            # await a stalled loop is frozen on (the per-iteration wait_for couldn't unwind it).
+            try:
+                for task in asyncio.all_tasks():
+                    buf = io.StringIO()
+                    task.print_stack(file=buf)
+                    logger.critical(f"STALL-DUMP [{task.get_name()}]\n{buf.getvalue()}")
+            except Exception as e:  # never let diagnostics block the restart
+                logger.critical(f"STALL-DUMP failed: {e}")
             os._exit(1)
 
     def _ensure_schema(self):
