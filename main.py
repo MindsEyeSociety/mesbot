@@ -41,6 +41,11 @@ DAILY_TASK_TIMEOUT = 600
 CHECK_USER_STATES_STALL_LIMIT = 240
 DAILY_TASK_STALL_LIMIT = 5400
 
+# How long the event scan remembers that an attendee is not in a guild before re-checking via
+# REST. Long enough that not-in-guild attendees aren't re-fetched every 60s pass (the original
+# 429 storm), short enough that a late joiner still gets their role within minutes.
+EVENT_ABSENT_TTL = 600
+
 
 def get_cursor():
     """Return a DB cursor, reconnecting the global connection if it went stale.
@@ -65,6 +70,7 @@ class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.check_user_states_task = None  # Store the task reference
+        self._event_absent = {}  # (guild_id, discord_id) -> monotonic ts: negative cache for the event scan
 
     async def setup_hook(self):
         """ Ensures tasks are started after the bot is ready """
@@ -696,25 +702,22 @@ class MyClient(discord.Client):
                 attendee_ids = [row[0] for row in cursor.fetchall()]
                 cursor.close()
 
-                # Some qualifying attendees may be in the guild but absent from the member
-                # cache — e.g. they joined before registering (so on_member_join couldn't
-                # assign yet) or their join was missed around a gateway reconnect. Refresh
-                # those over the gateway (NOT REST), so they get picked up without
-                # reintroducing the per-attendee REST scan. IDs not in the guild are simply
-                # not returned, and a fully-cached steady state makes zero gateway calls.
-                uncached = [d for d in attendee_ids if guild.get_member(d) is None]
-                for i in range(0, len(uncached), 100):  # query_members allows <=100 ids/call
-                    try:
-                        await guild.query_members(user_ids=uncached[i:i + 100], cache=True)
-                    except (discord.HTTPException, asyncio.TimeoutError) as e:
-                        logger.warning(f"query_members failed for {len(uncached[i:i + 100])} ids in {guild.name}: {e}")
-
                 for discord_id in attendee_ids:
-                    # Skip attendees who are not in the guild (None) or already hold the
-                    # role — no REST call and no redundant add_roles, so a steady state
-                    # where everyone already has the role costs zero HTTP requests.
+                    # Prefer the gateway-populated cache (no HTTP), so a steady state where
+                    # everyone already holds the role costs zero requests.
                     member = guild.get_member(discord_id)
-                    if member is None or role in member.roles:
+                    if member is None:
+                        # Cache miss: they may still be in the guild (joined before registering,
+                        # or their join was missed around a reconnect). Confirm with a single
+                        # REST fetch, throttled by a negative cache. We deliberately do NOT use
+                        # guild.query_members here: it shares discord.py's chunk-request
+                        # machinery and deadlocks against the gateway's automatic guild
+                        # re-chunking (startup + every reconnect), which froze this whole loop
+                        # for hours. fetch_member is plain REST and can't collide.
+                        member = await self._fetch_attendee(guild, guild_id, discord_id)
+                        if member is None:
+                            continue
+                    if role in member.roles:
                         continue
                     try:
                         await member.add_roles(role)
@@ -727,6 +730,35 @@ class MyClient(discord.Client):
             logger.critical(f"Fatal DB error in check_user_states, exiting: {e}")
             os._exit(1)
 
+    async def _fetch_attendee(self, guild, guild_id, discord_id):
+        """Resolve an event attendee missing from the member cache, via one throttled REST fetch.
+
+        Used by the event scan when ``get_member`` misses. A negative cache
+        (``self._event_absent``, keyed by ``(guild_id, discord_id)`` with a
+        ``EVENT_ABSENT_TTL``-second lifetime) stops genuinely-not-in-guild attendees from being
+        re-fetched every 60s pass — that per-attendee REST scan was the original 429 storm. A
+        member who later joins (even with a missed gateway event) is re-checked once the entry
+        expires, so they still get their role within a bounded delay.
+
+        @param guild_id: the guild the attendee is being checked against (cache key, not just
+            ``guild.id``, so the same person can be absent from one event guild yet present in
+            another).
+        @returns: the ``discord.Member`` if they are in the guild, else ``None``.
+        """
+        key = (guild_id, discord_id)
+        last_absent = self._event_absent.get(key)
+        if last_absent is not None and time.monotonic() - last_absent < EVENT_ABSENT_TTL:
+            return None  # recently confirmed absent — skip the REST call this pass
+        try:
+            member = await guild.fetch_member(discord_id)
+        except discord.NotFound:
+            self._event_absent[key] = time.monotonic()  # not in the guild; throttle re-checks
+            return None
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logger.warning(f"fetch_member failed for {discord_id} in {guild.name}: {e}")
+            return None
+        self._event_absent.pop(key, None)  # present after all — clear any stale absent mark
+        return member
 
     @check_user_states.before_loop
     async def before_check_user_states(self):

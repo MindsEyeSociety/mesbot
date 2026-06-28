@@ -134,12 +134,12 @@ def _make_guild(guild_id, roles, name="Test Guild"):
     guild.id = guild_id
     guild.name = name
     guild.roles = list(roles)
-    # get_member is the cache lookup (synchronous); fetch_member is the REST call the
-    # event scan must NOT use — kept here so tests can assert it is never called.
+    # get_member is the cache lookup (synchronous); fetch_member is the bounded REST fallback the
+    # event scan uses only on a cache miss (throttled by a negative cache). The scan must never
+    # call query_members — it deadlocks against discord.py's automatic guild re-chunking.
     guild.get_member = MagicMock(name="get_member")
     guild.fetch_member = AsyncMock(name="fetch_member")
-    # query_members is the gateway cache-refresh the scan uses for cache misses.
-    guild.query_members = AsyncMock(name="query_members")
+    guild.query_members = AsyncMock(name="query_members")  # present only to assert it stays unused
     return guild
 
 
