@@ -81,12 +81,15 @@ async def test_assign_announces_in_verification_channel(fake_db, discord_factori
         "server_event_roles": [(EVENT_ID, ROLE_ID)],
         "EventAttendee": [(1,)],
         "server_verification": [(999,)],
+        "PortalEvent": [("ConDiscordia 2026",)],
     }
 
     await main.MyClient.assign_event_role(client, member)
 
     member.add_roles.assert_awaited_once_with(role)
     ver_channel.send.assert_awaited_once()
+    sent = ver_channel.send.await_args.args[0]
+    assert role.name in sent and "ConDiscordia 2026" in sent
 
 
 async def test_assign_skips_non_attendee(fake_db, discord_factories):

@@ -166,12 +166,15 @@ async def test_scan_announces_in_verification_channel_on_assignment(fake_db, dis
         "server_event_roles": [(GUILD_ID, EVENT_ID, ROLE_ID)],
         "EventAttendee": [(DISCORD_ID,)],
         "server_verification": [(999,)],  # get_ver_channel -> this channel
+        "PortalEvent": [("ConDiscordia 2026",)],  # event-name lookup
     }
 
     await main.MyClient._check_user_states_once(client)
 
     member.add_roles.assert_awaited_once_with(role)
     ver_channel.send.assert_awaited_once()
+    sent = ver_channel.send.await_args.args[0]
+    assert role.name in sent and "ConDiscordia 2026" in sent  # names both the role and the event
 
 
 async def test_announce_event_role_silent_without_verification_channel(fake_db, discord_factories):
@@ -185,6 +188,6 @@ async def test_announce_event_role_silent_without_verification_channel(fake_db, 
     guild.get_channel = MagicMock(return_value=ver_channel)
     fake_db.responses = {}  # server_verification empty -> get_ver_channel None
 
-    await main.MyClient._announce_event_role(client, guild, member, discord_factories.role(ROLE_ID))
+    await main.MyClient._announce_event_role(client, guild, member, discord_factories.role(ROLE_ID), EVENT_ID)
 
     ver_channel.send.assert_not_awaited()
