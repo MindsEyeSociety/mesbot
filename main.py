@@ -722,7 +722,7 @@ class MyClient(discord.Client):
                     try:
                         await member.add_roles(role)
                         await self.log_message(guild_id, f"✅ Assigned event role {role.name} to {member.display_name}.")
-                        await self._announce_event_role(guild, member, role)
+                        await self._announce_event_role(guild, member, role, event_id)
                         logger.info(f"✅ Assigned event role {role.name} to {member.display_name} in {guild.name}")
                     except (discord.Forbidden, discord.HTTPException) as e:
                         logger.error(f"Failed to assign event role to {discord_id}: {e}")
@@ -1205,25 +1205,34 @@ class MyClient(discord.Client):
         finally:
             cursor.close()
 
-    async def _announce_event_role(self, guild, member, role):
-        """Post a public "now a paid attendee" note in the verification channel on event-role grant.
+    async def _announce_event_role(self, guild, member, role, event_id):
+        """Post a public "now has the role" note in the verification channel on event-role grant.
 
-        Lands in the same channel as the membership-verified welcome (``get_ver_channel`` ->
-        ``server_verification``). Best-effort and self-contained: it swallows its own errors so a
-        missing/forbidden channel can never break — or get mis-logged as a failure of — the role
-        assignment that calls it.
+        Names both the role and the event (``mes-portal.PortalEvent.name``). Lands in the same
+        channel as the membership-verified welcome (``get_ver_channel`` -> ``server_verification``).
+        Best-effort and self-contained: it swallows its own errors so a missing/forbidden channel
+        can never break — or get mis-logged as a failure of — the role assignment that calls it.
 
         @param guild: the guild the role was granted in.
         @param member: the member who just received the event role.
-        @param role: the event role (used only for logging context).
+        @param role: the event role (its ``name`` is shown in the message).
+        @param event_id: the PortalEvent id, resolved to the event name for the message.
         """
         try:
             ver_channel_id = await self.get_ver_channel(guild.id)
             if not ver_channel_id:
                 return
             channel = guild.get_channel(ver_channel_id) or await guild.fetch_channel(ver_channel_id)
-            if channel:
-                await channel.send(f"🎉 {member.mention} is now a paid attendee — see you at the event!")
+            if not channel:
+                return
+            cursor = get_cursor()
+            cursor.execute("SELECT name FROM `mes-portal`.PortalEvent WHERE id = %s", (event_id,))
+            row = cursor.fetchone()
+            cursor.close()
+            event_name = row[0] if row else "the event"
+            await channel.send(
+                f"🎉 {member.mention} now has the **{role.name}** role for **{event_name}** — see you there!"
+            )
         except (discord.Forbidden, discord.HTTPException) as e:
             logger.warning(f"Could not announce event role for {member.id} in {guild.name}: {e}")
 
@@ -1272,7 +1281,7 @@ class MyClient(discord.Client):
             try:
                 await member.add_roles(role)
                 await self.log_message(member.guild.id, f"✅ Assigned event role {role.name} to {member.display_name}.")
-                await self._announce_event_role(member.guild, member, role)
+                await self._announce_event_role(member.guild, member, role, event_id)
                 logger.info(f"✅ Assigned event role {role.name} to {member.display_name} in {member.guild.name}")
             except (discord.Forbidden, discord.HTTPException) as e:
                 logger.error(f"Failed to assign event role to {member.id}: {e}")
