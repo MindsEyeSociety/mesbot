@@ -68,7 +68,8 @@ One MySQL server hosts **two databases**, queried together via cross-DB referenc
   Auto-created on startup via `_ensure_schema` (the project has no migration system).
 
 ### Portal database `mes-portal` (read-mostly; owned by the Symfony membership portal)
-- `User` — `membershipNumber`, `emailAddress`, `firstName`, `lastName`, `membershipExpiration`,
+- `User` — `membershipNumber`, `emailAddress`, `firstName`, `lastName`, `nickname` (the member's
+  preferred name, shown in public welcome messages per the handbook), `membershipExpiration`,
   `membershipType`, `id`.
 - `EventAttendee` — `event_id` (→ `PortalEvent.id`), `user_id` (→ `User.id`; the portal-resolved
   attendee), `membershipNumberSubmitted` (raw buyer input), `zeffy_donation_id`, `registeredAt`.
