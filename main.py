@@ -16,6 +16,8 @@ import discord
 from urllib.parse import urlencode, urlparse, parse_qs
 from flask import Flask, request, redirect
 
+from name_utils import format_member_name
+
 load_dotenv()
 
 logging.basicConfig(
@@ -579,7 +581,7 @@ class MyClient(discord.Client):
 
                                 if auth_row and auth_row[0]:
                                     cursor.execute("""
-                                        SELECT firstName, lastName, membershipNumber
+                                        SELECT firstName, lastName, membershipNumber, nickname
                                         FROM `mes-portal`.User
                                         WHERE membershipNumber = %s
                                     """, (auth_row[0],))
@@ -587,13 +589,17 @@ class MyClient(discord.Client):
                                     cursor.fetchall()
                                     cursor.close()
 
-                                    user_result = f"{user_row[0]} {user_row[1]}" if user_row else "Unknown"
+                                    # Public messages honor the member's preferred name (handbook);
+                                    # internal logs keep the legal name for moderation.
+                                    display_name = format_member_name(user_row[0], user_row[1], user_row[3]) if user_row else "Unknown"
+                                    legal_name = f"{user_row[0]} {user_row[1]}" if user_row else "Unknown"
                                     auth_result = f"({user_row[2]})" if user_row else ""
                                 else:
-                                    user_result = ""
+                                    display_name = ""
+                                    legal_name = ""
                                     auth_result = ""
 
-                                welcome_text = f"Welcome {member.mention} {user_result} {auth_result} membership verified!"
+                                welcome_text = f"Welcome {member.mention} {display_name} {auth_result} membership verified!"
 
                                 # Send welcome message
                                 ver_channel_id = await self.get_ver_channel(guild_id)
@@ -606,7 +612,7 @@ class MyClient(discord.Client):
                                 else:
                                     await self.log_message(guild_id, welcome_text)
 
-                                await self.log_message(guild_id, f"Member {member.name} {user_result} {auth_result} assigned role {role.name} via stored token.")
+                                await self.log_message(guild_id, f"Member {member.name} {legal_name} {auth_result} assigned role {role.name} via stored token.")
                                 await member.send(f"✅ You've been assigned the role '{role.name}' on {guild.name} automatically.")
                                 logger.info(f"✅ Assigned role {role.name} to {member.display_name} in {guild.name}")
                                 await self.log_message(guild_id, f"✅ Assigned role {role.name} to {member.display_name}.")
@@ -1106,7 +1112,7 @@ class MyClient(discord.Client):
                                 cursor.fetchall()
                                 if auth_row and auth_row[0]:
                                     cursor.execute("""
-                                        SELECT firstName, lastName, membershipNumber
+                                        SELECT firstName, lastName, membershipNumber, nickname
                                         FROM `mes-portal`.User
                                         WHERE membershipNumber = %s
                                     """, (auth_row[0],))
@@ -1114,15 +1120,21 @@ class MyClient(discord.Client):
                                     cursor.fetchall()
                                     cursor.close()
                                     if user_row:
-                                        user_result = f"{user_row[0]} {user_row[1]}"
+                                        # Public messages honor the member's preferred name (handbook);
+                                        # internal logs keep the legal name for moderation.
+                                        display_name = format_member_name(user_row[0], user_row[1], user_row[3])
+                                        legal_name = f"{user_row[0]} {user_row[1]}"
                                         auth_result = f"({user_row[2]})"
                                     else:
-                                        user_result = ""
+                                        display_name = ""
+                                        legal_name = ""
                                         auth_result = ""
                                 else:
-                                    user_result = ""
+                                    display_name = ""
+                                    legal_name = ""
                                     auth_result = ""
-                                welcome_text = f"Welcome {member.mention} {user_result} {auth_result} membership verified!"
+                                welcome_text = f"Welcome {member.mention} {display_name} {auth_result} membership verified!"
+                                log_text = f"Welcome {member.mention} {legal_name} {auth_result} membership verified!"
                                 await member.send(f"You've been assigned the role '{role.name}' on server '{member.guild.name}' automatically via your stored token.")
                                 ver_channel_id = await self.get_ver_channel(member.guild.id)
                                 if ver_channel_id:
@@ -1133,7 +1145,7 @@ class MyClient(discord.Client):
                                     else:
                                         # Verification channel deleted
                                         await self.log_message(member.guild.id, f"⚠️ Verification channel {ver_channel_id} no longer exists!")
-                                await self.log_message(member.guild.id,welcome_text)
+                                await self.log_message(member.guild.id,log_text)
                             except Exception as e:
                                 logger.error(f"Error assigning role to {member.name} on {member.guild.name}: {e}")
                                 await self.log_message(member.guild.id,f"Error: Unable to assign {member.name} role {role.name}: {e}")

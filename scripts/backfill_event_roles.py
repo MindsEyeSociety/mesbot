@@ -48,6 +48,10 @@ import discord
 import mysql.connector
 from dotenv import load_dotenv
 
+# Make the project root (where name_utils.py lives) importable when run as a script.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from name_utils import format_member_name  # noqa: E402
+
 load_dotenv()
 
 logging.basicConfig(
@@ -116,7 +120,7 @@ def compute_grants(cursor, event_id, ticketing_id=None, include_zeffy_email=Fals
                EXISTS(SELECT 1 FROM `mes-portal`.EventAttendee ea
                       WHERE ea.event_id = %s
                         AND ea.membershipNumberSubmitted = ua.access_token) AS by_number,
-               {zeffy_expr} AS by_zeffy
+               {zeffy_expr} AS by_zeffy, u.nickname
         FROM user_authorizations ua
         JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
         WHERE u.membershipExpiration >= CURDATE()
@@ -124,11 +128,11 @@ def compute_grants(cursor, event_id, ticketing_id=None, include_zeffy_email=Fals
     """
     cursor.execute(query, tuple(params))
     grants = []
-    for discord_user_id, membership_number, first, last, by_userid, by_number, by_zeffy in cursor.fetchall():
+    for discord_user_id, membership_number, first, last, by_userid, by_number, by_zeffy, nickname in cursor.fetchall():
         grants.append({
             "discord_user_id": discord_user_id,
             "membership_number": membership_number,
-            "name": f"{first or ''} {last or ''}".strip() or "Unknown",
+            "name": format_member_name(first, last, nickname) or "Unknown",
             "by_userid": bool(by_userid),
             "by_number": bool(by_number),
             "by_zeffy": bool(by_zeffy),
