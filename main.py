@@ -49,6 +49,32 @@ DAILY_TASK_STALL_LIMIT = 5400
 EVENT_ABSENT_TTL = 600
 
 
+def db_connect():
+    """Open a MySQL connection for the bot, with autocommit ON.
+
+    ``autocommit=True`` is load-bearing, not a style choice. mysql-connector defaults it to
+    False, and the server runs REPEATABLE READ, so a connection's first SELECT pins a consistent
+    snapshot that survives until the transaction ends. The background loops read far more often
+    than they write, so an idle pass never commits — the snapshot then never refreshes and rows
+    committed by the *other* process (server.py's oauth_callback writing user_authorizations)
+    stay invisible to this one indefinitely. That silently strands verified members: the loop
+    ticks, sees nothing to do, and never assigns the role. Autocommit ends each statement's
+    transaction, so every query reads fresh data. The explicit ``cnx.commit()`` calls after
+    writes remain correct (they become no-ops).
+
+    @return An open ``mysql.connector`` connection to the bot database.
+    @throws mysql.connector.Error if the database cannot be reached.
+    @see server.py's ``db_connect`` — the same fix on the Flask side of the same database.
+    """
+    return mysql.connector.connect(
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        host=os.getenv('DB_SERVER'),
+        database=os.getenv('DB_DATABASE'),
+        autocommit=True,
+    )
+
+
 def get_cursor():
     """Return a DB cursor, reconnecting the global connection if it went stale.
 
@@ -59,12 +85,7 @@ def get_cursor():
     try:
         cnx.ping(reconnect=True, attempts=3, delay=2)
     except mysql.connector.Error:
-        cnx = mysql.connector.connect(
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            host=os.getenv('DB_SERVER'),
-            database=os.getenv('DB_DATABASE')
-        )
+        cnx = db_connect()
     return cnx.cursor()
 
 
@@ -1306,8 +1327,7 @@ intents.message_content = True
 intents.guilds = True
 
 try:
-  cnx = mysql.connector.connect(user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), host= os.getenv('DB_SERVER'),
-                                database=os.getenv('DB_DATABASE'))
+  cnx = db_connect()
 except mysql.connector.Error as err:
   if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
     logger.critical("Something is wrong with your user name or password")
