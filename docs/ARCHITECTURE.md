@@ -52,6 +52,16 @@ MESBot is two Python processes that share a database:
 One MySQL server hosts **two databases**, queried together via cross-DB references
 (`` `mes-portal`.Table ``).
 
+> **Connections must be opened with `autocommit=True`** (`db_connect` in both `main.py` and
+> `server.py`). mysql-connector defaults it to False and the server runs REPEATABLE READ, so a
+> connection's first `SELECT` pins a read snapshot that lasts until the transaction ends. The bot's
+> loops read far more often than they write, so an idle pass never commits — the snapshot then never
+> refreshes, and rows committed by the *other* process (the Flask app writing `user_authorizations`)
+> stay invisible to the bot indefinitely. The symptom is nasty and silent: a member completes OAuth,
+> `oauth_callback` returns 200, and the bot's `check_user_states` loop keeps ticking, sees no new
+> authorization, and never assigns the role. Do not remove the setting, and open every new connection
+> through `db_connect`.
+
 ### Bot database (owned by MESBot)
 - **`user_authorizations`** — the permanent map: `discord_user_id` (unique) ↔ `access_token`.
   Note: **`access_token` stores the MES `membershipNumber`**, not an OAuth token.
@@ -71,6 +81,12 @@ One MySQL server hosts **two databases**, queried together via cross-DB referenc
 - `User` — `membershipNumber`, `emailAddress`, `firstName`, `lastName`, `nickname` (the member's
   preferred name, shown in public welcome messages per the handbook), `membershipExpiration`,
   `membershipType`, `id`.
+  - `membershipType` is the portal's own enum and is **wider than the set that may verify**. Values
+    in use: `Full`, `Trial`, `Monthly` (all three grant access — see `VALID_MEMBERSHIP_TYPES` in
+    `server.py`), plus `None` (registered but never bought a membership), `DNR`, `Expelled`,
+    `Resigned`, and legacy junk (`0`, NULL). If the portal adds a paid tier, it must be added to
+    `VALID_MEMBERSHIP_TYPES` or those members are locked out of Discord. Type is only half the gate;
+    `membershipExpiration` is checked separately.
 - `EventAttendee` — `event_id` (→ `PortalEvent.id`), `user_id` (→ `User.id`; the portal-resolved
   attendee), `membershipNumberSubmitted` (raw buyer input), `zeffy_donation_id`, `registeredAt`.
 - `PortalEvent` — `id`, `name`, `startDate`, `zeffyTicketingId`.

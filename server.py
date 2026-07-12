@@ -22,6 +22,43 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 
+VALID_MEMBERSHIP_TYPES = frozenset({"Full", "Trial", "Monthly"})
+"""Portal ``membershipType`` values that entitle a member to Discord access.
+
+Mirrors the types the portal actually issues to paying//trialling members. The portal also
+carries ``None`` (registered, never bought a membership), ``DNR``, ``Expelled``, ``Resigned``
+and legacy junk (``0``, NULL) — none of which may verify. ``Monthly`` is a real, current
+subscription tier and belongs here: omitting it silently locked active subscribers out of
+Discord with a message telling them to get a membership they already had.
+
+Membership *validity* is a separate check: :func:`is_membership_expired` still gates on the
+expiration date, so a lapsed Monthly/Full/Trial member is rejected on that basis instead.
+"""
+
+
+def db_connect():
+    """Open a MySQL connection for the OAuth server, with autocommit ON.
+
+    ``autocommit=True`` is load-bearing, not a style choice. mysql-connector defaults it to
+    False, and the server runs REPEATABLE READ, so a connection's first SELECT pins a consistent
+    snapshot that survives until the transaction ends — making rows committed by the *other*
+    process (main.py's loops) invisible to this one. Autocommit ends each statement's
+    transaction, so every query reads fresh data. The explicit ``cnx.commit()`` after the
+    ``user_authorizations`` write remains correct (it becomes a no-op).
+
+    @return An open ``mysql.connector`` connection to the bot database.
+    @throws mysql.connector.Error if the database cannot be reached.
+    @see main.py's ``db_connect`` — the same fix on the bot side of the same database.
+    """
+    return mysql.connector.connect(
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        host=os.getenv('DB_SERVER'),
+        database=os.getenv('DB_DATABASE'),
+        autocommit=True,
+    )
+
+
 def get_cursor():
     """Return a DB cursor, reconnecting the global connection if it went stale.
 
@@ -32,13 +69,22 @@ def get_cursor():
     try:
         cnx.ping(reconnect=True, attempts=3, delay=2)
     except mysql.connector.Error:
-        cnx = mysql.connector.connect(
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            host=os.getenv('DB_SERVER'),
-            database=os.getenv('DB_DATABASE')
-        )
+        cnx = db_connect()
     return cnx.cursor()
+
+
+def is_membership_type_valid(membership_type) -> bool:
+    """Report whether a portal ``membershipType`` entitles the member to Discord access.
+
+    @param membership_type: The portal's ``membershipType`` for the member — any of the values
+        the portal issues (``"Full"``, ``"Trial"``, ``"Monthly"``, ``"None"``, ``"DNR"``,
+        ``"Expelled"``, ``"Resigned"``), or None/absent for records that never had one.
+    @return True if the type is one of :data:`VALID_MEMBERSHIP_TYPES`.
+
+    Example: ``is_membership_type_valid("Monthly")`` → ``True``;
+    ``is_membership_type_valid("None")`` → ``False``.
+    """
+    return membership_type in VALID_MEMBERSHIP_TYPES
 
 
 def is_membership_expired(membership_expiration: str) -> bool:
@@ -51,10 +97,11 @@ def oauth_callback():
     """Complete the OAuth flow and record the member's authorization.
 
     Exchanges the authorization ``code`` for an access token, fetches the member's
-    portal profile, and rejects anyone without a current Full/Trial membership. On
-    success it upserts a row into ``user_authorizations`` keyed by the Discord user
-    id resolved from the pending ``user_states`` row (matched by ``state`` within a
-    15-minute window).
+    portal profile, and rejects anyone whose membership type is not in
+    :data:`VALID_MEMBERSHIP_TYPES`, or whose membership has expired. On success it
+    upserts a row into ``user_authorizations`` keyed by the Discord user id resolved
+    from the pending ``user_states`` row (matched by ``state`` within a 15-minute
+    window).
 
     It deliberately does NOT delete the ``user_states`` row: the bot's
     ``check_user_states`` loop relies on that row to discover the new authorization,
@@ -110,11 +157,12 @@ def oauth_callback():
     user_info = user_info_response.json()
     logger.debug("OAuth callback state: %s", state)
     logger.debug("User info from portal: %s", user_info)
-    if user_info['membershipType'] in {"Full","Trial"}:
+    membership_type = user_info.get('membershipType')
+    if is_membership_type_valid(membership_type):
         logger.debug("Valid membership for state %s", state)
     else:
-        logger.warning("Invalid membership type for state %s", state)
-        return f"Invalid membership, you must have a Trial or Full membership", 400
+        logger.warning("Invalid membership type %r for state %s", membership_type, state)
+        return f"Invalid membership, you must have a Full, Trial or Monthly membership", 400
     if(is_membership_expired(user_info['membershipExpiration'])):
         logger.debug("Membership expired: %s exp %s", user_info['membershipNumber'], user_info['membershipExpiration'])
         return f"Membership expired. Please renew your membership and try again.", 400
@@ -173,8 +221,7 @@ def oauth_authorize():
 
 
 try:
-  cnx = mysql.connector.connect(user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), host= os.getenv('DB_SERVER'),
-                                database=os.getenv('DB_DATABASE'))
+  cnx = db_connect()
 except mysql.connector.Error as err:
   if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
     logger.critical("DB auth failed: bad credentials")
