@@ -1,0 +1,3 @@
+# Install to /etc/cron.d/mesbot-supervisor-alert (root-owned, mode 0644, no execute bit).
+# Matches the 5-minute cadence of the fleet-wide host-health-alert job.
+*/5 * * * * root /usr/local/sbin/mesbot-supervisor-alert.sh
