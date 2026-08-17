@@ -202,6 +202,51 @@ async def test_daily_task_flags_first_time_without_removing(fake_db, discord_fac
     assert any("INSERT INTO unauthorized_users" in s for s in fake_db.sql)
 
 
+async def test_daily_task_flag_message_uses_display_name_not_id(fake_db, discord_factories):
+    """The mod-facing log message must be human-readable: name, not raw Discord ID."""
+    role1 = discord_factories.role(R1)
+    member1 = discord_factories.member(USER_ID, roles=[role1], display_name="Andy Sutton")
+    guild1 = discord_factories.guild(G1, roles=[role1])
+    guild1.fetch_members = lambda: _aiter([member1])
+    guild1.fetch_member = AsyncMock(return_value=member1)
+
+    client = _real_client()
+    client.fetch_guild = AsyncMock(return_value=guild1)
+
+    fake_db.responses = {
+        "FROM server_roles": [(G1, R1)],
+        # no expired_members row -> no prior membership number known
+    }
+
+    await main.MyClient._daily_task_once(client)
+
+    messages = [call.args[1] for call in client.log_message.await_args_list]
+    assert any("Andy Sutton" in m and "has not verified" in m for m in messages)
+    assert not any(str(USER_ID) in m for m in messages)
+
+
+async def test_daily_task_flag_message_includes_prior_membership_number(fake_db, discord_factories):
+    """When `expired_members` has audit history for this user, surface the membership number."""
+    role1 = discord_factories.role(R1)
+    member1 = discord_factories.member(USER_ID, roles=[role1], display_name="Andy Sutton")
+    guild1 = discord_factories.guild(G1, roles=[role1])
+    guild1.fetch_members = lambda: _aiter([member1])
+    guild1.fetch_member = AsyncMock(return_value=member1)
+
+    client = _real_client()
+    client.fetch_guild = AsyncMock(return_value=guild1)
+
+    fake_db.responses = {
+        "FROM server_roles": [(G1, R1)],
+        "membership_number FROM expired_members": [("US2002023241",)],
+    }
+
+    await main.MyClient._daily_task_once(client)
+
+    messages = [call.args[1] for call in client.log_message.await_args_list]
+    assert any("Andy Sutton" in m and "US2002023241" in m for m in messages)
+
+
 # --- cross-DB membership-validation join guard ------------------------------------------
 
 async def test_membership_validation_joins_are_well_formed(fake_db, discord_factories):

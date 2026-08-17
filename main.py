@@ -461,6 +461,7 @@ class MyClient(discord.Client):
                                 logger.error(f"Self-heal: failed to assign {role.name} to {member.id} in {guild.name}: {e}")
 
                     users_with_role = [member.id for member in members if role in member.roles]
+                    members_by_id = {member.id: member for member in members}
 
                     logger.info(f"Users with {role_id} are {users_with_role}")
                     for user_id in users_with_role:
@@ -495,8 +496,18 @@ class MyClient(discord.Client):
                             cnx.commit()
                             cursor.close()
                             logger.info(f"Logged unauthorized user {user_id} in guild {guild.name}.")
-                            await self.log_message(guild.id, f"User {user_id} has role {role.name} but has not verified.")
-                            member = await guild.fetch_member(user_id)
+                            member = members_by_id.get(user_id)
+
+                            cursor = get_cursor()
+                            cursor.execute("SELECT membership_number FROM expired_members WHERE discord_user_id = %s", (user_id,))
+                            expired_entry = cursor.fetchone()
+                            cursor.fetchall()
+                            cursor.close()
+                            membership_number = expired_entry[0] if expired_entry else None
+
+                            name = member.display_name if member else f"user {user_id}"
+                            suffix = f" (previous MES membership number: {membership_number})" if membership_number else ""
+                            await self.log_message(guild.id, f"{name} has role {role.name} but has not verified.{suffix}")
                             if member and user_id not in dm_notified:
                                 dm_notified.add(user_id)  # at most one "please validate" DM per run
                                 try:
