@@ -89,6 +89,37 @@ def get_cursor():
     return cnx.cursor()
 
 
+def format_dm_failure_message(display_name, member_id, what, error, retry_hint=""):
+    """Build the admin-facing logging-channel text for a DM the bot could not deliver.
+
+    Names the member (display name, mention and id) so admins can find them, says what
+    was not delivered, gives a short reason, and tells admins how to fix it.
+
+    @param display_name: Member's server display name.
+    @param member_id: Member's Discord user id (used for the mention and the id).
+    @param what: Short noun phrase for what failed to send, e.g. "the verification link".
+    @param error: The exception raised by ``send``. A ``discord.Forbidden`` with code
+        50007 or 50278 is reported as blocked DMs; anything else uses the exception text.
+    @param retry_hint: Optional clause appended to the advice, e.g. "then run !auth again".
+    @return: The message string.
+
+    Example::
+
+        format_dm_failure_message("Sam", 42, "the verification link", err, "then run !auth again")
+        # "⚠️ Could not DM the verification link to Sam (<@42>, id 42): the member's privacy
+        #  settings block DMs from this bot. Ask them to enable 'Direct Messages' from server
+        #  members in this server's Privacy Settings, then run !auth again."
+    """
+    if isinstance(error, discord.Forbidden) and getattr(error, "code", None) in (50007, 50278):
+        reason = "the member's privacy settings block DMs from this bot"
+    else:
+        reason = str(error) or type(error).__name__
+    advice = "Ask them to enable 'Direct Messages' from server members in this server's Privacy Settings"
+    if retry_hint:
+        advice += f", {retry_hint}"
+    return f"⚠️ Could not DM {what} to {display_name} (<@{member_id}>, id {member_id}): {reason}. {advice}."
+
+
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -512,10 +543,14 @@ class MyClient(discord.Client):
                                 dm_notified.add(user_id)  # at most one "please validate" DM per run
                                 try:
                                     await member.send("Please follow the steps provided to validate your membership.")
-                                    await self.on_member_join(member)
-                                except Exception:
-                                    await self.log_message(guild.id, f"Can't send PM to user {member.name}")
-                                    logger.error(f"Can't send PM to user {user_id}")
+                                except Exception as e:
+                                    await self.notify_dm_failure(guild.id, member, "the validation reminder", e, "then run !auth")
+                                else:
+                                    # on_member_join reports its own DM failure, so only reached when DMs work.
+                                    try:
+                                        await self.on_member_join(member)
+                                    except Exception as e:
+                                        logger.error(f"Error sending auth link to user {user_id}: {e}")
                         elif action == "remove":
                             member = await guild.fetch_member(user_id)
                             if member:
@@ -527,8 +562,8 @@ class MyClient(discord.Client):
                                         dm_notified.add(user_id)
                                         try:
                                             await member.send(f"Your role '{role.name}' on '{guild.name}' has been removed as you have not validated your membership.")
-                                        except Exception:
-                                            logger.error(f"Can't send removal PM to user {user_id}")
+                                        except Exception as e:
+                                            await self.notify_dm_failure(guild.id, member, "the role-removal notice", e)
                                     # Clear the flag only AFTER a successful removal, so any
                                     # failure keeps the flag and retries without re-notifying.
                                     cursor = get_cursor()
@@ -645,7 +680,11 @@ class MyClient(discord.Client):
                                     await self.log_message(guild_id, welcome_text)
 
                                 await self.log_message(guild_id, f"Member {member.name} {legal_name} {auth_result} assigned role {role.name} via stored token.")
-                                await member.send(f"✅ You've been assigned the role '{role.name}' on {guild.name} automatically.")
+                                try:
+                                    await member.send(f"✅ You've been assigned the role '{role.name}' on {guild.name} automatically.")
+                                except (discord.Forbidden, discord.HTTPException) as e:
+                                    # The role is already added; a DM failure must not read as a role failure.
+                                    await self.notify_dm_failure(guild_id, member, "the role-assigned notice", e)
                                 logger.info(f"✅ Assigned role {role.name} to {member.display_name} in {guild.name}")
                                 await self.log_message(guild_id, f"✅ Assigned role {role.name} to {member.display_name}.")
                             except Exception:
@@ -1167,7 +1206,11 @@ class MyClient(discord.Client):
                                     auth_result = ""
                                 welcome_text = f"Welcome {member.mention} {display_name} {auth_result} membership verified!"
                                 log_text = f"Welcome {member.mention} {legal_name} {auth_result} membership verified!"
-                                await member.send(f"You've been assigned the role '{role.name}' on server '{member.guild.name}' automatically via your stored token.")
+                                try:
+                                    await member.send(f"You've been assigned the role '{role.name}' on server '{member.guild.name}' automatically via your stored token.")
+                                except (discord.Forbidden, discord.HTTPException) as e:
+                                    # The role is already added; a DM failure must not read as a role failure.
+                                    await self.notify_dm_failure(member.guild.id, member, "the role-assigned notice", e)
                                 ver_channel_id = await self.get_ver_channel(member.guild.id)
                                 if ver_channel_id:
                                     guild = await self.fetch_guild(member.guild.id)
@@ -1205,7 +1248,7 @@ class MyClient(discord.Client):
                 try:
                     message = await member.send(f"If you are an MES member, this bot is setup to automatically validate your membership and give you full access to MES discord servers.\nPlease authenticate with our service by clicking here: {auth_url}\nThis link expires after 15 minutes, and you can use the !auth command to generate a new link.\nIf you have questions or are interested in joining one of our LARPs, you can ask questions and get advice in the welcome room without verification or membership. https://discord.gg/dEudtugYdM")
                 except (discord.Forbidden, discord.HTTPException) as e:
-                    logger.error(f"Could not DM auth link to {member.id}: {e}")
+                    await self.notify_dm_failure(member.guild.id, member, "the verification link", e, "then run !auth again")
                     return
                 # Store message_id and state
                 cursor=get_cursor()
@@ -1218,6 +1261,27 @@ class MyClient(discord.Client):
         except mysql.connector.Error as e:
             logger.error(f"DB error in on_member_join for {member.id}: {e}")
             return
+
+    async def notify_dm_failure(self, guild_id, member, what, error, retry_hint=""):
+        """Log a failed member DM to the server log and post it to the guild's logging channel.
+
+        @param guild_id: Guild whose logging channel receives the message.
+        @param member: The member the DM was addressed to.
+        @param what: Short noun phrase for what failed to send, e.g. "the role-removal notice".
+        @param error: The exception raised by ``member.send``.
+        @param retry_hint: Optional advice clause, see :func:`format_dm_failure_message`.
+
+        Example::
+
+            except discord.Forbidden as e:
+                await self.notify_dm_failure(guild.id, member, "the verification link", e)
+        """
+        logger.error(f"Could not DM {what} to {member.id}: {error}")
+        try:
+            await self.log_message(guild_id, format_dm_failure_message(member.display_name, member.id, what, error, retry_hint))
+        except Exception as e:
+            # Reporting is best-effort; it must never abort the caller's flow (e.g. clearing a flag).
+            logger.error(f"Could not post DM failure for {member.id} to logging channel in guild {guild_id}: {e}")
 
     async def log_message(self, guild_id, message):
         # logs a message in the configured logging channel or else does nothing
