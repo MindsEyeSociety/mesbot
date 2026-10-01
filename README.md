@@ -82,7 +82,7 @@ Admin commands cannot be sent via DM and require the Administrator permission.
 
 ## Permissions
 
-MESBot needs permission to view channels, send messages, and (optionally) control the server ban list. Users will also need to allow MESBot to send DMs, as sign-in URLs cannot be posted publicly for security.
+MESBot needs permission to view channels, send messages, and (optionally) control the server ban list. Users will also need to allow MESBot to send DMs, as sign-in URLs cannot be posted publicly for security. If MESBot cannot DM a member (for example the verification link, a role-removal notice, or a role-assigned notice), it posts a warning naming the member in the logging channel. Ask that member to enable "Direct Messages" from server members in the server's Privacy Settings, then have them run `!auth` again.
 
 ## Configuration
 
