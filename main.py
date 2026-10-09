@@ -48,6 +48,39 @@ DAILY_TASK_STALL_LIMIT = 5400
 # 429 storm), short enough that a late joiner still gets their role within minutes.
 EVENT_ABSENT_TTL = 600
 
+# Shared matching rule for "this verified member is registered for this event", used by BOTH the
+# periodic scan and the on-join grant so the two cannot drift apart. A registration matches when
+# the portal-resolved account (EventAttendee.user_id, which the portal also derives from the
+# payer's email when the typed number is garbage) is the member, OR the number typed into the
+# Zeffy form equals the member's membership number (fallback for rows with no resolved user_id).
+# user_authorizations.access_token stores the MES membershipNumber. Takes one %s: the event id.
+EVENT_ATTENDEE_MATCH_SQL = """
+    FROM user_authorizations ua
+    JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
+    JOIN `mes-portal`.EventAttendee ea
+      ON (ea.user_id = u.id OR ea.membershipNumberSubmitted = ua.access_token)
+    WHERE ea.event_id = %s
+      AND u.membershipExpiration >= CURDATE()
+"""
+
+
+def build_event_attendee_query(select, extra_where="", suffix=""):
+    """Compose a query over the shared event-attendee match (EVENT_ATTENDEE_MATCH_SQL).
+
+    Exists so every grant path selects from the identical join/filter. The event id is always
+    the first ``%s``; any placeholders in ``extra_where`` follow it.
+
+    @param select: Select clause, e.g. ``"SELECT DISTINCT ua.discord_user_id"``.
+    @param extra_where: Optional extra conditions, each starting with ``AND`` (may hold ``%s``).
+    @param suffix: Optional trailing clause such as ``"LIMIT 1"``.
+    @return The full SQL string.
+
+    Example:
+        build_event_attendee_query("SELECT 1", "AND ua.discord_user_id = %s", "LIMIT 1")
+        # execute with (event_id, discord_user_id)
+    """
+    return f"{select}{EVENT_ATTENDEE_MATCH_SQL}{extra_where}\n{suffix}"
+
 
 def db_connect():
     """Open a MySQL connection for the bot, with autocommit ON.
@@ -768,14 +801,10 @@ class MyClient(discord.Client):
                     continue
 
                 cursor = get_cursor()
-                cursor.execute("""
-                    SELECT DISTINCT ua.discord_user_id
-                    FROM user_authorizations ua
-                    JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
-                    JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
-                    WHERE ea.event_id = %s
-                      AND u.membershipExpiration >= CURDATE()
-                """, (event_id,))
+                cursor.execute(
+                    build_event_attendee_query("SELECT DISTINCT ua.discord_user_id"),
+                    (event_id,),
+                )
                 attendee_ids = [row[0] for row in cursor.fetchall()]
                 cursor.close()
 
@@ -1348,7 +1377,9 @@ class MyClient(discord.Client):
         """Assign the event role to a member if they are a registered event attendee.
 
         Checks server_event_roles for this guild's configured event, then verifies the
-        member's MES membership number appears in mes-portal.EventAttendee for that event.
+        member has a registration in mes-portal.EventAttendee for that event, matched by the
+        portal-resolved account (EventAttendee.user_id) or, as a fallback, by the typed
+        membership number (see EVENT_ATTENDEE_MATCH_SQL).
         Does nothing if no event is configured for this guild, the role is already
         assigned, or the member has not completed OAuth verification.
 
@@ -1372,15 +1403,10 @@ class MyClient(discord.Client):
             return
 
         cursor = get_cursor()
-        cursor.execute("""
-            SELECT 1
-            FROM user_authorizations ua
-            JOIN `mes-portal`.EventAttendee ea ON ua.access_token = ea.membershipNumberSubmitted
-            JOIN `mes-portal`.User u ON ua.access_token = u.membershipNumber
-            WHERE ua.discord_user_id = %s AND ea.event_id = %s
-              AND u.membershipExpiration >= CURDATE()
-            LIMIT 1
-        """, (member.id, event_id))
+        cursor.execute(
+            build_event_attendee_query("SELECT 1", "AND ua.discord_user_id = %s", "LIMIT 1"),
+            (event_id, member.id),
+        )
         is_attendee = cursor.fetchone()
         cursor.fetchall()
         cursor.close()
