@@ -75,7 +75,7 @@ Admin commands cannot be sent via DM and require the Administrator permission.
 | Command | Description |
 |---|---|
 | `!role [role name or role id]` | Configures the role that you want MESBot to assign to authenticated members. Please note: it will also remove this role after a grace period of 7 days from any discord members who do not authenticate. This includes bots, etc. Please ensure that your bots, etc. are granted permissions via a different role than the one you use for members. Run without arguments to see the current setting. |
-| `!setlog [#channel]` | Configures logging messages to inform you of errors or actions that MESBot is taking on your server. Tag the channel where you want the messages to be sent, or run without arguments to use the current channel. Make sure that MESBot has access to the channel. |
+| `!setlog [#channel]` | Configures logging messages to inform you of errors or actions that MESBot is taking on your server. Tag the channel where you want the messages to be sent, or run without arguments to use the current channel. Make sure that MESBot has access to the channel. If it cannot post there, it records a warning in its own server log and carries on. |
 | `!setver #channel` | Configures the verification channel where MESBot will post welcome messages for authorized members. MESBot must be able to post in this channel. |
 | `!setevent <event_id> <role>` | Configures event role assignment: registers the MES portal event ID and the Discord role to assign to registered attendees. Run without arguments to see the current setting. |
 | `!clearevent` | Removes the event role configuration for this server. |

@@ -386,6 +386,8 @@ class MyClient(discord.Client):
                         except discord.HTTPException as e:
                             await self.log_message(guild.id, f"❌ Failed to ban {user_id}: {e}")
                             logger.error(f"❌ Failed to ban {user_id} in {guild.name}: {e}")
+                    except discord.HTTPException as e:
+                        logger.error(f"Error checking ban for {user_id} in {guild.name}: {e}")
             cursor.close()
             #clearing users from banlist
             cursor=get_cursor()
@@ -489,6 +491,9 @@ class MyClient(discord.Client):
                     except discord.NotFound:
                         logger.warning(f"Guild id {guild_id} not found")
                         continue
+                    except discord.HTTPException as e:  # includes Forbidden
+                        logger.error(f"Could not fetch guild {guild_id}, skipping it this run: {e}")
+                        continue
                     if not guild:
                         logger.warning(f"Guild id {guild_id} not found")
                         continue
@@ -498,7 +503,11 @@ class MyClient(discord.Client):
                         logger.warning(f"Role id {role_id} not found")
                         continue
 
-                    members = [member async for member in guild.fetch_members()]
+                    try:
+                        members = [member async for member in guild.fetch_members()]
+                    except discord.HTTPException as e:  # includes Forbidden
+                        logger.error(f"Could not fetch members of {guild.name}, skipping it this run: {e}")
+                        continue
                     logger.info(f"Fetched {len(members)} members from {guild.name}")
 
                     # Self-heal: grant the configured role to any member who is verified with a
@@ -585,7 +594,13 @@ class MyClient(discord.Client):
                                     except Exception as e:
                                         logger.error(f"Error sending auth link to user {user_id}: {e}")
                         elif action == "remove":
-                            member = await guild.fetch_member(user_id)
+                            try:
+                                member = await guild.fetch_member(user_id)
+                            except discord.NotFound:
+                                member = None  # left the server; handled as "not found" below
+                            except discord.HTTPException as e:  # includes Forbidden
+                                logger.error(f"Could not fetch member {user_id} in {guild.name}, skipping: {e}")
+                                continue
                             if member:
                                 result = await self._remove_role_with_retry(member, role)
                                 if result == "removed":
@@ -665,9 +680,20 @@ class MyClient(discord.Client):
             #print(f"Found {len(results)}")
             for user_id, guild_id, role_id in results:
                 logger.info(f"User id: {user_id} guild id: {guild_id} role id: {role_id}")
-                guild = await self.fetch_guild(guild_id)
+                guild = member = None
+                try:
+                    guild = await self.fetch_guild(guild_id)
+                    member = await guild.fetch_member(user_id) if guild else None
+                except (discord.NotFound, discord.Forbidden):
+                    # Bot removed from the guild / member left: fall through to the "not found"
+                    # reporting below (guild or member left as None), which also clears the
+                    # user_states row so it isn't retried forever.
+                    pass
+                except discord.HTTPException as e:
+                    # Transient: keep the user_states row (it expires on its own) and move on.
+                    logger.error(f"Could not fetch guild {guild_id} / member {user_id}, will retry: {e}")
+                    continue
                 if guild:
-                    member = await guild.fetch_member(user_id)
                     if member:
                         role = discord.utils.get(guild.roles, id=role_id)
                         if role:
@@ -762,15 +788,19 @@ class MyClient(discord.Client):
                     logger.error(f"Error updating expired link in message {state}")
                 if msg_result:
                     message_id = msg_result[0]
-                    user = await self.fetch_user(user_id)
-                    dm_channel = user.dm_channel
-                    if dm_channel:
-                        message = await dm_channel.fetch_message(message_id)
-                        new_content = "[🔗 Link Expired]\nuse command !auth to request a new link"
-                        await message.edit(content=new_content)
-                        logger.info(f"Link expired message updated {message_id}")
-                    else:
-                        logger.warning(f"Unable to DM {user.name}")
+                    try:
+                        user = await self.fetch_user(user_id)
+                        dm_channel = user.dm_channel
+                        if dm_channel:
+                            message = await dm_channel.fetch_message(message_id)
+                            new_content = "[🔗 Link Expired]\nuse command !auth to request a new link"
+                            await message.edit(content=new_content)
+                            logger.info(f"Link expired message updated {message_id}")
+                        else:
+                            logger.warning(f"Unable to DM {user.name}")
+                    except discord.HTTPException as e:
+                        # Message deleted / user gone / DMs closed: nothing more to do for this link.
+                        logger.warning(f"Could not mark link expired for user {user_id} (message {message_id}): {e}")
                 else:
                     logger.warning(f"Message {state} not found")
                 try:
@@ -1313,24 +1343,48 @@ class MyClient(discord.Client):
             logger.error(f"Could not post DM failure for {member.id} to logging channel in guild {guild_id}: {e}")
 
     async def log_message(self, guild_id, message):
-        # logs a message in the configured logging channel or else does nothing
+        """Post ``message`` to the guild's configured logging channel, best-effort.
+
+        Reporting must never take down the work being reported on: this is called from the
+        background loops and event handlers, so a Discord failure here (the bot can't see or
+        post in the channel, the channel or guild was deleted, a 5xx) is recorded in the server
+        log at warning level and swallowed. Database errors are NOT swallowed — they propagate
+        so the callers' fatal-DB handling still sees them.
+
+        @param guild_id: Guild whose ``server_logging`` channel receives the message.
+        @param message: Text to post. Only its first 200 characters appear in failure log lines.
+        @returns None always; delivery is not guaranteed.
+
+        Example::
+
+            await self.log_message(guild.id, f"Removed role {role.name} from {member.name}.")
+
+        @see notify_dm_failure
+        """
         cursor=get_cursor()
         cursor.execute("SELECT channel_id FROM server_logging WHERE guild_id = %s", (guild_id,))
         result = cursor.fetchone()
         cursor.close()
-        if result:
-            channel_id=result[0]
-            guild = await self.fetch_guild(guild_id)
-            if guild:
-                log_channel = await guild.fetch_channel(channel_id)
-                if log_channel:
-                    await log_channel.send(message)
-                else:
-                    logger.warning(f"⚠️ Logging channel {channel_id} not found in guild {guild_id}.")
-            else:
-                logger.warning(f"⚠️ Guild {guild_id} not found.")
-        else:
+        if not result:
             logger.warning(f"⚠️ No logging channel set for guild {guild_id}.")
+            return
+        channel_id=result[0]
+        try:
+            guild = await self.fetch_guild(guild_id)
+            if not guild:
+                logger.warning(f"⚠️ Guild {guild_id} not found.")
+                return
+            log_channel = await guild.fetch_channel(channel_id)
+            if not log_channel:
+                logger.warning(f"⚠️ Logging channel {channel_id} not found in guild {guild_id}.")
+                return
+            await log_channel.send(message)
+        except discord.HTTPException as e:
+            # Forbidden and NotFound are HTTPException subclasses.
+            logger.warning(
+                f"⚠️ Could not post to logging channel {channel_id} in guild {guild_id} "
+                f"({type(e).__name__}: {e}). Message was: {message[:200]!r}"
+            )
 
     async def get_ver_channel(self, guild_id: int):
         """Returns verification channel ID or None"""
