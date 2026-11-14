@@ -39,6 +39,10 @@ When a server admin configures an event with `!setevent`, MESBot automatically a
 
 If a membership expires, the bot checks daily for expired memberships and removes the assigned role from those users. After the membership is renewed, they can once again get a token to restore their access.
 
+### Leaving a Server
+
+When the bot is removed from a server, it deletes that server's stored settings (`server_roles`, `server_logging`, `server_verification`, `server_event_roles`, `unauthorized_users` and `user_states` rows) and logs one warning naming the rows removed. The daily run does the same for any server Discord reports as gone (404) that the bot's cache also no longer holds; a 403, a 5xx or any other Discord error only skips the server until the next run. If the bot is re-added, an admin must run the setup commands again.
+
 ### Membership Renewal Reminders
 
 Users with a token will receive a discord notification 4 weeks, 2 weeks, and 1 week before your membership expires. You will also be notified the day that your membership expires.

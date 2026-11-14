@@ -122,6 +122,59 @@ def get_cursor():
     return cnx.cursor()
 
 
+GUILD_CONFIG_TABLES = (
+    "server_roles",
+    "server_logging",
+    "server_verification",
+    "server_event_roles",
+    "unauthorized_users",
+    "user_states",
+)
+
+
+def purge_guild_config(guild_id):
+    """Delete every per-guild row for a guild the bot has left, so it is not retried forever.
+
+    Removes the guild's rows from each table in ``GUILD_CONFIG_TABLES`` in ONE transaction: either
+    all six deletes are committed together or none are. A DB error rolls the transaction back and
+    is re-raised so the callers' fatal-DB handling still sees it. Logs one WARNING line naming the
+    guild and the rows removed per table, so an admin can re-run the setup commands if the bot is
+    ever re-added.
+
+    @param guild_id: Discord id of the guild whose configuration is deleted. Only rows with this
+        guild_id are touched; queries are parameterized.
+    @returns Dict mapping each table name to the number of rows deleted from it.
+    @throws mysql.connector.Error if the database cannot be reached or a delete fails.
+
+    Example::
+
+        purge_guild_config(689568652760186967)
+        # WARNING: Purged config for departed guild 689568652760186967 (server_roles=1, ..., unauthorized_users=9, ...)
+        # -> {"server_roles": 1, "server_logging": 0, ..., "unauthorized_users": 9, "user_states": 0}
+
+    @see MyClient.on_guild_remove
+    @see MyClient._daily_task_once
+    """
+    cursor = get_cursor()
+    deleted = {}
+    try:
+        # autocommit is ON for the connection, so open an explicit transaction to keep the six
+        # deletes atomic.
+        cnx.start_transaction()
+        for table in GUILD_CONFIG_TABLES:
+            cursor.execute(f"DELETE FROM {table} WHERE guild_id = %s", (guild_id,))
+            deleted[table] = cursor.rowcount
+        cnx.commit()
+    except mysql.connector.Error:
+        cnx.rollback()
+        raise
+    finally:
+        cursor.close()
+    summary = ", ".join(f"{table}={count}" for table, count in deleted.items())
+    logger.warning(f"Purged config for departed guild {guild_id} ({summary})")
+    return deleted
+
+
 def format_dm_failure_message(display_name, member_id, what, error, retry_hint=""):
     """Build the admin-facing logging-channel text for a DM the bot could not deliver.
 
@@ -489,13 +542,13 @@ class MyClient(discord.Client):
                     try:
                         guild = await self.fetch_guild(guild_id)
                     except discord.NotFound:
-                        logger.warning(f"Guild id {guild_id} not found")
+                        self._purge_if_departed(guild_id)
                         continue
                     except discord.HTTPException as e:  # includes Forbidden
                         logger.error(f"Could not fetch guild {guild_id}, skipping it this run: {e}")
                         continue
                     if not guild:
-                        logger.warning(f"Guild id {guild_id} not found")
+                        self._purge_if_departed(guild_id)
                         continue
 
                     role = discord.utils.get(guild.roles, id=role_id)
@@ -1320,6 +1373,35 @@ class MyClient(discord.Client):
         except mysql.connector.Error as e:
             logger.error(f"DB error in on_member_join for {member.id}: {e}")
             return
+
+    def _purge_if_departed(self, guild_id):
+        """Purge a guild's config when Discord reports it missing AND the gateway cache agrees.
+
+        Called when the daily run cannot find a guild. A 404 alone is not trusted: if the cache
+        still holds the guild the bot is evidently still in it, so this only logs and the guild is
+        retried next run. DB errors propagate (see :func:`purge_guild_config`).
+
+        @param guild_id: Guild the daily run failed to find.
+        @see purge_guild_config
+        """
+        if self.get_guild(guild_id) is None:
+            purge_guild_config(guild_id)
+        else:
+            logger.warning(f"Guild id {guild_id} not found by fetch but still cached; not purging")
+
+    async def on_guild_remove(self, guild):
+        """Delete a guild's stored configuration when the bot is removed from it.
+
+        DB errors are logged and swallowed, like :meth:`on_member_join`; the daily run purges any
+        guild this misses.
+
+        @param guild: The guild the bot left or was removed from.
+        @see purge_guild_config
+        """
+        try:
+            purge_guild_config(guild.id)
+        except mysql.connector.Error as e:
+            logger.error(f"DB error in on_guild_remove for {guild.id}: {e}")
 
     async def notify_dm_failure(self, guild_id, member, what, error, retry_hint=""):
         """Log a failed member DM to the server log and post it to the guild's logging channel.
