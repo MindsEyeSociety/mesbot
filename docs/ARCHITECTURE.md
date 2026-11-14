@@ -18,7 +18,7 @@ MESBot is two Python processes that share a database:
 - **`daily_task`** — `@tasks.loop(hours=1)`, gated to run its maintenance once per calendar day. Processes
   the global ban/unban lists, sends membership-expiration reminders, removes the role from unverified
   members after a grace period, and self-heals the member role (grants it to any verified, valid member
-  who is missing it).
+  who is missing it). Guilds marked inactive (`server_roles.active = FALSE`) are reactivated if back in the cache, else skipped.
 - **`loop_watchdog`** — `@tasks.loop(seconds=60)`. Resilience backstop. Each of the two loops above wraps
   its body in `asyncio.wait_for` (cancels a cancellable async hang and retries next tick) and stamps a
   `time.monotonic()` heartbeat after every pass. The watchdog `os._exit(1)`s (→ supervisor restart) if a
@@ -67,7 +67,7 @@ One MySQL server hosts **two databases**, queried together via cross-DB referenc
   Note: **`access_token` stores the MES `membershipNumber`**, not an OAuth token.
 - **`user_states`** — transient per-OAuth row `(state, user_id, guild_id, timestamp)`; also the work
   queue telling the bot "this user just verified — assign the role and welcome them in this guild."
-- `server_roles` (member role per guild), `server_event_roles` (`guild_id, event_id, role_id`),
+- `server_roles` (member role per guild; `active` BOOLEAN, FALSE once the bot has left the guild — config is kept, the daily run skips inactive guilds, and rejoining or `!setrole` reactivates; column added on startup by `_migrate_server_roles_active`), `server_event_roles` (`guild_id, event_id, role_id`),
   `server_verification`, `server_logging`, `banned_users`, `unbanned_users`, `unauthorized_users`
   (`user_id, guild_id, notified_at` — per-guild grace flag for members holding the role without a
   valid membership), `daily_tasks` (`task_name, last_run_date` — once-per-day gate per section),

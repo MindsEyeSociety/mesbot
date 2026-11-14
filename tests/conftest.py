@@ -58,6 +58,7 @@ class FakeCursor:
         self._responses = responses
         self._executed = executed
         self._rows = []
+        self.rowcount = 0
 
     def execute(self, sql, params=None):
         self._executed.append((sql, params))
