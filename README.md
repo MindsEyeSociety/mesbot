@@ -41,7 +41,7 @@ If a membership expires, the bot checks daily for expired memberships and remove
 
 ### Leaving a Server
 
-When the bot is removed from a server, it deletes that server's stored settings (`server_roles`, `server_logging`, `server_verification`, `server_event_roles`, `unauthorized_users` and `user_states` rows) and logs one warning naming the rows removed. The daily run does the same for any server Discord reports as gone (404) that the bot's cache also no longer holds; a 403, a 5xx or any other Discord error only skips the server until the next run. If the bot is re-added, an admin must run the setup commands again.
+When the bot is removed from a server, it marks that server inactive (`server_roles.active = FALSE`) and logs one warning. Nothing is deleted: all of the server's settings are kept. The daily run does the same for any server Discord reports as gone (404) that the bot's cache also no longer holds, and then skips inactive servers, so they no longer produce "Guild id … not found" warnings; a 403, a 5xx or any other Discord error only skips the server until the next run. If the bot is re-added, the server is reactivated automatically (on join, or by the next daily run if the bot was offline) with no re-setup, and running `!role` also reactivates it. The `active` column is added to `server_roles` automatically on startup.
 
 ### Membership Renewal Reminders
 

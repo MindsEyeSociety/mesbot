@@ -122,57 +122,110 @@ def get_cursor():
     return cnx.cursor()
 
 
-GUILD_CONFIG_TABLES = (
-    "server_roles",
-    "server_logging",
-    "server_verification",
-    "server_event_roles",
-    "unauthorized_users",
-    "user_states",
-)
+def _migrate_server_roles_active():
+    """Add the `active` column to `server_roles` if it is missing, so departed guilds can be kept.
 
+    MySQL 8.4 has no `ADD COLUMN IF NOT EXISTS`, so this checks `information_schema.COLUMNS`
+    first and only then runs the ALTER. Safe to run on every startup; existing rows default to
+    active. Logs INFO when the migration actually ran.
 
-def purge_guild_config(guild_id):
-    """Delete every per-guild row for a guild the bot has left, so it is not retried forever.
-
-    Removes the guild's rows from each table in ``GUILD_CONFIG_TABLES`` in ONE transaction: either
-    all six deletes are committed together or none are. A DB error rolls the transaction back and
-    is re-raised so the callers' fatal-DB handling still sees it. Logs one WARNING line naming the
-    guild and the rows removed per table, so an admin can re-run the setup commands if the bot is
-    ever re-added.
-
-    @param guild_id: Discord id of the guild whose configuration is deleted. Only rows with this
-        guild_id are touched; queries are parameterized.
-    @returns Dict mapping each table name to the number of rows deleted from it.
-    @throws mysql.connector.Error if the database cannot be reached or a delete fails.
+    @returns True if the ALTER ran, False if the column already existed.
+    @throws mysql.connector.Error if the database cannot be reached or a statement fails.
 
     Example::
 
-        purge_guild_config(689568652760186967)
-        # WARNING: Purged config for departed guild 689568652760186967 (server_roles=1, ..., unauthorized_users=9, ...)
-        # -> {"server_roles": 1, "server_logging": 0, ..., "unauthorized_users": 9, "user_states": 0}
+        _migrate_server_roles_active()
+        # INFO: Migrated server_roles: added active column
+        # -> True (first startup); False thereafter
 
-    @see MyClient.on_guild_remove
-    @see MyClient._daily_task_once
+    @see MyClient._ensure_schema
     """
     cursor = get_cursor()
-    deleted = {}
     try:
-        # autocommit is ON for the connection, so open an explicit transaction to keep the six
-        # deletes atomic.
-        cnx.start_transaction()
-        for table in GUILD_CONFIG_TABLES:
-            cursor.execute(f"DELETE FROM {table} WHERE guild_id = %s", (guild_id,))
-            deleted[table] = cursor.rowcount
-        cnx.commit()
-    except mysql.connector.Error:
-        cnx.rollback()
-        raise
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'server_roles' "
+            "AND COLUMN_NAME = 'active'"
+        )
+        if cursor.fetchone() is not None:
+            return False
+        cursor.execute("ALTER TABLE server_roles ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE")
     finally:
         cursor.close()
-    summary = ", ".join(f"{table}={count}" for table, count in deleted.items())
-    logger.warning(f"Purged config for departed guild {guild_id} ({summary})")
-    return deleted
+    logger.info("Migrated server_roles: added active column")
+    return True
+
+
+def deactivate_guild(guild_id):
+    """Mark a guild the bot has left as inactive, keeping all of its configuration.
+
+    Sets `server_roles.active` to FALSE so the daily run stops trying to fetch the guild. Only an
+    active row changes, so repeat calls are no-ops. No guild config is deleted. Logs one WARNING,
+    only on the active -> inactive transition (rowcount > 0). Errors propagate so the callers'
+    fatal-DB handling still sees them.
+
+    @param guild_id: Discord id of the guild to mark inactive.
+    @returns True if the guild was newly marked inactive, False otherwise (already inactive, or
+        no server_roles row).
+    @throws mysql.connector.Error if the database cannot be reached or the update fails.
+
+    Example::
+
+        deactivate_guild(689568652760186967)
+        # WARNING: Guild 689568652760186967 marked inactive; its config is kept
+        # -> True
+        deactivate_guild(689568652760186967)
+        # -> False
+
+    @see reactivate_guild
+    @see MyClient.on_guild_remove
+    @see MyClient._deactivate_if_departed
+    """
+    cursor = get_cursor()
+    try:
+        cursor.execute(
+            "UPDATE server_roles SET active = FALSE WHERE guild_id = %s AND active = TRUE",
+            (guild_id,),
+        )
+        changed = cursor.rowcount > 0
+    finally:
+        cursor.close()
+    if changed:
+        logger.warning(f"Guild {guild_id} marked inactive; its config is kept")
+    return changed
+
+
+def reactivate_guild(guild_id):
+    """Mark a previously inactive guild active again, e.g. because the bot rejoined it.
+
+    Sets `server_roles.active` back to TRUE; only an inactive row changes. No guild config is
+    touched. Logs INFO on the inactive -> active transition. Errors propagate.
+
+    @param guild_id: Discord id of the guild to reactivate.
+    @returns True if the guild was reactivated, False if it was not inactive.
+    @throws mysql.connector.Error if the database cannot be reached or the update fails.
+
+    Example::
+
+        reactivate_guild(689568652760186967)
+        # INFO: Guild 689568652760186967 reactivated
+        # -> True
+
+    @see deactivate_guild
+    @see MyClient.on_guild_join
+    """
+    cursor = get_cursor()
+    try:
+        cursor.execute(
+            "UPDATE server_roles SET active = TRUE WHERE guild_id = %s AND active = FALSE",
+            (guild_id,),
+        )
+        changed = cursor.rowcount > 0
+    finally:
+        cursor.close()
+    if changed:
+        logger.info(f"Guild {guild_id} reactivated")
+    return changed
 
 
 def format_dm_failure_message(display_name, member_id, what, error, retry_hint=""):
@@ -274,9 +327,11 @@ class MyClient(discord.Client):
 
         Idempotent (CREATE TABLE IF NOT EXISTS), so it's safe to run on every startup;
         this is how new bot tables ship since the project has no migration system. Currently
-        ensures `expired_members`, the audit log of memberships that have lapsed.
+        ensures `expired_members`, the audit log of memberships that have lapsed, and migrates
+        `server_roles` to carry the `active` column (see :func:`_migrate_server_roles_active`).
 
         @see _record_expired_member
+        @see _migrate_server_roles_active
         """
         cursor = get_cursor()
         cursor.execute("""
@@ -289,6 +344,7 @@ class MyClient(discord.Client):
         """)
         cnx.commit()
         cursor.close()
+        _migrate_server_roles_active()
 
     def _record_expired_member(self, discord_user_id, membership_number, expiration_date):
         """Record (audit) that a member's MES membership has lapsed.
@@ -525,8 +581,10 @@ class MyClient(discord.Client):
             # Idempotent, so marking it done only on completion lets an interrupted run retry.
             if self._gate_should_run('daily_maintenance'):
                 logger.info(f"Running daily maintenance for {datetime.date.today()}")
+                # A guild that rejoined while the bot was offline is back in the cache.
+                self._reactivate_cached_guilds()
                 cursor = get_cursor()
-                cursor.execute("SELECT guild_id, role_id FROM server_roles")
+                cursor.execute("SELECT guild_id, role_id FROM server_roles WHERE active = TRUE")
                 servers = cursor.fetchall()
                 cursor.close()
 
@@ -542,13 +600,13 @@ class MyClient(discord.Client):
                     try:
                         guild = await self.fetch_guild(guild_id)
                     except discord.NotFound:
-                        self._purge_if_departed(guild_id)
+                        self._deactivate_if_departed(guild_id)
                         continue
                     except discord.HTTPException as e:  # includes Forbidden
                         logger.error(f"Could not fetch guild {guild_id}, skipping it this run: {e}")
                         continue
                     if not guild:
-                        self._purge_if_departed(guild_id)
+                        self._deactivate_if_departed(guild_id)
                         continue
 
                     role = discord.utils.get(guild.roles, id=role_id)
@@ -1080,8 +1138,8 @@ class MyClient(discord.Client):
                     cursor=get_cursor()
                     try:
                         cursor.execute(
-                                "INSERT INTO server_roles (guild_id, role_id) VALUES (%s, %s) "
-                                "ON DUPLICATE KEY UPDATE role_id = %s",
+                                "INSERT INTO server_roles (guild_id, role_id, active) VALUES (%s, %s, TRUE) "
+                                "ON DUPLICATE KEY UPDATE role_id = %s, active = TRUE",
                                 (guild_id, role_id, role_id)
                         )
                         cnx.commit()
@@ -1374,34 +1432,67 @@ class MyClient(discord.Client):
             logger.error(f"DB error in on_member_join for {member.id}: {e}")
             return
 
-    def _purge_if_departed(self, guild_id):
-        """Purge a guild's config when Discord reports it missing AND the gateway cache agrees.
+    def _deactivate_if_departed(self, guild_id):
+        """Mark a guild inactive when Discord reports it missing AND the gateway cache agrees.
 
         Called when the daily run cannot find a guild. A 404 alone is not trusted: if the cache
         still holds the guild the bot is evidently still in it, so this only logs and the guild is
-        retried next run. DB errors propagate (see :func:`purge_guild_config`).
+        retried next run. Nothing is deleted. DB errors propagate (see :func:`deactivate_guild`).
 
         @param guild_id: Guild the daily run failed to find.
-        @see purge_guild_config
+        @see deactivate_guild
         """
         if self.get_guild(guild_id) is None:
-            purge_guild_config(guild_id)
+            deactivate_guild(guild_id)
         else:
-            logger.warning(f"Guild id {guild_id} not found by fetch but still cached; not purging")
+            logger.warning(f"Guild id {guild_id} not found by fetch but still cached; not deactivating")
+
+    def _reactivate_cached_guilds(self):
+        """Reactivate every inactive guild the gateway cache still holds (a rejoin while offline).
+
+        Selects `server_roles` rows with `active = FALSE` and reactivates those for which
+        `self.get_guild()` returns a guild. Run after `wait_until_ready`, so the cache is
+        populated. DB errors propagate.
+
+        @returns List of guild ids that were reactivated.
+        @see reactivate_guild
+        """
+        cursor = get_cursor()
+        try:
+            cursor.execute("SELECT guild_id FROM server_roles WHERE active = FALSE")
+            inactive_ids = [row[0] for row in cursor.fetchall()]
+        finally:
+            cursor.close()
+        return [gid for gid in inactive_ids
+                if self.get_guild(gid) is not None and reactivate_guild(gid)]
 
     async def on_guild_remove(self, guild):
-        """Delete a guild's stored configuration when the bot is removed from it.
+        """Mark a guild inactive (keeping its configuration) when the bot is removed from it.
 
-        DB errors are logged and swallowed, like :meth:`on_member_join`; the daily run purges any
+        DB errors are logged and swallowed, like :meth:`on_member_join`; the daily run marks any
         guild this misses.
 
         @param guild: The guild the bot left or was removed from.
-        @see purge_guild_config
+        @see deactivate_guild
         """
         try:
-            purge_guild_config(guild.id)
+            deactivate_guild(guild.id)
         except mysql.connector.Error as e:
             logger.error(f"DB error in on_guild_remove for {guild.id}: {e}")
+
+    async def on_guild_join(self, guild):
+        """Reactivate a guild's stored configuration when the bot is (re)added to it.
+
+        DB errors are logged and swallowed, as in :meth:`on_guild_remove`; the daily run
+        reactivates any guild this misses.
+
+        @param guild: The guild the bot joined.
+        @see reactivate_guild
+        """
+        try:
+            reactivate_guild(guild.id)
+        except mysql.connector.Error as e:
+            logger.error(f"DB error in on_guild_join for {guild.id}: {e}")
 
     async def notify_dm_failure(self, guild_id, member, what, error, retry_hint=""):
         """Log a failed member DM to the server log and post it to the guild's logging channel.
