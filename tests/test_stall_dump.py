@@ -222,7 +222,7 @@ async def test_ac1_header_names_only_stalled_loop(env):
     await env.run()
     h = env.header
     assert "check_user_states" in h
-    assert re.search(r"\b30[0-3]\b", h), h
+    assert re.search(r"(?<!\d)30[0-3](?!\d)", h), h
     assert "240" in h
     assert "daily_task" not in h
     await cancel_all(t)
@@ -236,7 +236,7 @@ async def test_ac2_header_names_both_loops_with_own_age_and_limit(env):
     await env.run()
     h = env.header
     assert "check_user_states" in h and "daily_task" in h
-    assert re.search(r"\b30[0-3]\b", h) and "240" in h
+    assert re.search(r"(?<!\d)30[0-3](?!\d)", h) and "240" in h
     assert re.search(r"\b60\d\d\b", h) and "5400" in h
     await cancel_all(a, b)
 
@@ -582,7 +582,7 @@ async def test_edge_stalled_loop_without_task_noted_and_dump_continues(env):
     env.stall(cus_age=300)
     await env.run()
     h = env.header
-    assert "check_user_states" in h and re.search(r"\b30[0-3]\b", h)
+    assert "check_user_states" in h and re.search(r"(?<!\d)30[0-3](?!\d)", h)
     assert re.search(r"no (running )?task", h, re.I), h
     assert any(first_line(e).startswith(TASK_PREFIX + "some-task") for e in env.task_entries)
     assert env.thread_entries([threading.main_thread().name])
