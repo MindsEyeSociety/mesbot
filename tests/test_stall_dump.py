@@ -237,7 +237,7 @@ async def test_ac2_header_names_both_loops_with_own_age_and_limit(env):
     h = env.header
     assert "check_user_states" in h and "daily_task" in h
     assert re.search(r"(?<!\d)30[0-3](?!\d)", h) and "240" in h
-    assert re.search(r"\b60\d\d\b", h) and "5400" in h
+    assert re.search(r"(?<!\d)60\d\d(?!\d)", h) and "5400" in h
     await cancel_all(a, b)
 
 
