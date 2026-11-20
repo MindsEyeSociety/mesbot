@@ -37,6 +37,10 @@ MESBot is two Python processes that share a database:
   Use `grep 'STALLED LOOP'` to find the frozen loop. The dump records code locations only (file, line,
   function, source line), never locals, arguments or reprs. It is synchronous (`dump_stall_diagnostics`
   in `main.py`), and any failure inside it is logged in one line and never stops the `os._exit(1)`.
+  A failure while dumping one task or thread is logged as a `STALL-DUMP error ...` entry, and the dump
+  carries on with the next one. The await chain is walked by hand (`cr_await` / `gi_yieldfrom` /
+  `ag_await`, capped at `STALL_DUMP_MAX_DEPTH`), not with `asyncio.capture_call_graph`, which only
+  exists from Python 3.14. This keeps the dump working on the 3.11+ interpreter the host runs.
 
 ## Deployment
 

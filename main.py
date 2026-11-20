@@ -436,11 +436,13 @@ def dump_stall_diagnostics(stalled, tasks=None):
     Plain (non-async) so it can't hang on the stalled resource and can run without an event loop.
 
     @param stalled: output of ``_stalled_loop_report``.
-    @param tasks: snapshot of asyncio tasks to dump; defaults to ``asyncio.all_tasks()`` (which
-        needs a running loop; without one, only the stalled loops' tasks and threads are dumped).
+    @param tasks: snapshot of asyncio tasks to dump; defaults to ``asyncio.all_tasks()``. With no
+        running loop (e.g. called from plain synchronous code), the tasks of the stalled loops'
+        event loops are used instead.
 
     Example: ``dump_stall_diagnostics(_stalled_loop_report(client, time.monotonic()))``
     """
+    # Each step is guarded on its own so one failure (FR-9) never suppresses the later steps.
     try:
         parts = []
         for loop_name, age, limit, task in stalled:
@@ -454,11 +456,7 @@ def dump_stall_diagnostics(stalled, tasks=None):
         _stall_log(f"STALL-DUMP error building header: {_describe_error(e)}")
 
     if tasks is None:
-        try:
-            tasks = asyncio.all_tasks()
-        except Exception as e:
-            _stall_log(f"STALL-DUMP error listing asyncio tasks: {_describe_error(e)}")
-            tasks = ()
+        tasks = _snapshot_tasks(stalled)
     try:
         tasks = list(tasks)
     except Exception as e:
@@ -466,11 +464,14 @@ def dump_stall_diagnostics(stalled, tasks=None):
         tasks = []
 
     dumped = set()
-    for loop_name, _age, _limit, task in stalled:
-        if task is None or id(task) in dumped:
-            continue
-        dumped.add(id(task))
-        _dump_task(task, stalled_loop=loop_name)
+    try:
+        for loop_name, _age, _limit, task in stalled:
+            if task is None or id(task) in dumped:
+                continue
+            dumped.add(id(task))
+            _guarded_dump_task(task, stalled_loop=loop_name)
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error dumping stalled loop tasks: {_describe_error(e)}")
 
     others = [t for t in tasks if id(t) not in dumped]
     try:
@@ -478,9 +479,50 @@ def dump_stall_diagnostics(stalled, tasks=None):
     except Exception:
         pass
     for task in others:
-        _dump_task(task)
+        _guarded_dump_task(task)
 
-    _dump_threads()
+    try:
+        _dump_threads()
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error dumping threads: {_describe_error(e)}")
+
+
+def _guarded_dump_task(task, stalled_loop=None):
+    # ``_dump_task`` already catches its own errors; this also covers a failure in that handler,
+    # so the dump still moves on to the next task.
+    try:
+        _dump_task(task, stalled_loop=stalled_loop)
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error dumping task {_task_name(task)}: {_describe_error(e)}")
+
+
+def _snapshot_tasks(stalled):
+    """Return the asyncio task snapshot for the dump, taken once at its start.
+
+    ``asyncio.all_tasks()`` needs a running loop; when there isn't one, fall back to
+    ``all_tasks(loop)`` for the loops the stalled tasks belong to, which works on a non-running loop.
+    """
+    try:
+        return asyncio.all_tasks()
+    except RuntimeError:
+        pass
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error listing asyncio tasks: {_describe_error(e)}")
+        return ()
+    found = set()
+    try:
+        loops = []
+        for _name, _age, _limit, task in stalled:
+            if task is None:
+                continue
+            loop = task.get_loop()
+            if all(loop is not seen for seen in loops):
+                loops.append(loop)
+        for loop in loops:
+            found.update(asyncio.all_tasks(loop))
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error listing asyncio tasks: {_describe_error(e)}")
+    return found
 
 
 class MyClient(discord.Client):
