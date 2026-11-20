@@ -2,8 +2,11 @@
 
 import time
 import asyncio
-import io
+import inspect
+import linecache
 import logging
+import sys
+import threading
 from discord.ext import tasks
 import uuid
 import datetime
@@ -42,6 +45,15 @@ DAILY_TASK_TIMEOUT = 600
 # when gated).
 CHECK_USER_STATES_STALL_LIMIT = 240
 DAILY_TASK_STALL_LIMIT = 5400
+
+# Order matters: the stall dump lists stalled loops (header and task entries) in this order.
+WATCHED_LOOPS = (
+    ("check_user_states", "_cus_last_ok", CHECK_USER_STATES_STALL_LIMIT),
+    ("daily_task", "_daily_last_ok", DAILY_TASK_STALL_LIMIT),
+)
+
+# Bounds the manual await-chain walk so a pathological chain can't make the dump run forever.
+STALL_DUMP_MAX_DEPTH = 200
 
 # How long the event scan remembers that an attendee is not in a guild before re-checking via
 # REST. Long enough that not-in-guild attendees aren't re-fetched every 60s pass (the original
@@ -259,6 +271,218 @@ def format_dm_failure_message(display_name, member_id, what, error, retry_hint="
     return f"⚠️ Could not DM {what} to {display_name} (<@{member_id}>, id {member_id}): {reason}. {advice}."
 
 
+# --- Stall dump -----------------------------------------------------------------------------
+# Everything below is synchronous on purpose: the dump runs inside the watchdog pass while some
+# resource is hung, so it must never await (it could hang on the very thing that stalled).
+# It records code locations only (file, line, function, source line) and names awaitables by
+# type, never locals, arguments or reprs, so no token or member data can reach the log.
+
+def _stall_log(message):
+    """Log one stall-dump entry; swallow logging failures so the restart is never blocked."""
+    try:
+        logger.critical(message)
+    except Exception:
+        pass
+
+
+def _describe_error(error):
+    # Exception text is capped so a chatty error can't flood the log during a restart.
+    try:
+        text = str(error)
+    except Exception:
+        text = ""
+    text = text[:200]
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
+def _format_frame(frame):
+    """Return the code location of one frame as traceback-style lines (no locals)."""
+    code = frame.f_code
+    lineno = frame.f_lineno
+    text = f'  File "{code.co_filename}", line {lineno}, in {code.co_name}'
+    source = linecache.getline(code.co_filename, lineno).strip()
+    if source:
+        text += f"\n    {source}"
+    return text
+
+
+def _frame_and_next(awaitable):
+    """Return ``(frame, next awaitable)`` for a coroutine, generator or async generator.
+
+    Returns ``(None, None)`` for anything without a frame (futures, C-level awaitables).
+    """
+    for frame_attr, next_attr in (("cr_frame", "cr_await"),
+                                  ("gi_frame", "gi_yieldfrom"),
+                                  ("ag_frame", "ag_await")):
+        if hasattr(awaitable, frame_attr):
+            return getattr(awaitable, frame_attr), getattr(awaitable, next_attr, None)
+    return None, None
+
+
+def _task_await_chain(task):
+    """Return the lines of ``task``'s await chain, outermost coroutine first.
+
+    ``Task.print_stack`` shows only the outermost frame of a suspended task; this walks
+    ``cr_await``/``gi_yieldfrom``/``ag_await`` down to the innermost suspension point, and ends
+    with the type of a frameless awaitable (e.g. ``Future``) the innermost frame is waiting on.
+    """
+    if task.done():
+        state = "cancelled" if task.cancelled() else "finished"
+        return [f"  (task is done: {state}; no await chain)"]
+    coro = task.get_coro()
+    if coro is None:
+        return ["  (task has no coroutine; no await chain)"]
+    lines = []
+    if inspect.iscoroutine(coro) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED:
+        lines.append("  (task not yet started)")
+    # The future the task is blocked on. Needed because the C ``await fut`` hands the coroutine an
+    # opaque ``FutureIter`` that doesn't expose the future, so the walk alone can't name its type.
+    waiter = getattr(task, "_fut_waiter", None)
+    seen = set()
+    current = coro
+    for _ in range(STALL_DUMP_MAX_DEPTH):
+        if current is None:
+            if waiter is not None:
+                lines.append(f"  awaiting <{type(waiter).__qualname__}>")
+            return lines
+        if id(current) in seen:
+            lines.append("  ... (await cycle detected; chain truncated)")
+            return lines
+        seen.add(id(current))
+        frame, nxt = _frame_and_next(current)
+        if frame is None:
+            if hasattr(current, "cr_frame") or hasattr(current, "gi_frame") or hasattr(current, "ag_frame"):
+                lines.append(f"  <{type(current).__qualname__}> (finished; no frame)")
+            else:
+                awaited = current
+                if not isinstance(current, asyncio.Future) and waiter is not None:
+                    awaited = waiter
+                lines.append(f"  awaiting <{type(awaited).__qualname__}>")
+            return lines
+        lines.append(_format_frame(frame))
+        current = nxt
+    if current is not None:
+        lines.append(f"  ... (chain truncated after {STALL_DUMP_MAX_DEPTH} entries)")
+    return lines
+
+
+def _task_name(task):
+    try:
+        return task.get_name()
+    except Exception:
+        return f"<unnamed {type(task).__name__}>"
+
+
+def _dump_task(task, stalled_loop=None):
+    """Log one task's entry: ``STALL-DUMP task <name>`` (+ stalled-loop marker), then its chain."""
+    name = _task_name(task)
+    try:
+        header = f"STALL-DUMP task {name}"
+        if stalled_loop:
+            header += f" [STALLED LOOP: {stalled_loop}]"
+        _stall_log("\n".join([header] + _task_await_chain(task)))
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error dumping task {name}: {_describe_error(e)}")
+
+
+def _dump_threads():
+    """Log every live thread's current Python stack, one entry per thread, outermost frame first."""
+    try:
+        frames = sys._current_frames()
+        names = {t.ident: t.name for t in threading.enumerate()}
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error listing threads: {_describe_error(e)}")
+        return
+    for ident, top in frames.items():
+        name = names.get(ident, "<unknown>")
+        try:
+            stack = []
+            frame = top
+            while frame is not None and len(stack) < STALL_DUMP_MAX_DEPTH:
+                stack.append(_format_frame(frame))
+                frame = frame.f_back
+            if frame is not None:
+                stack.append(f"  ... (stack truncated after {STALL_DUMP_MAX_DEPTH} frames)")
+            stack.reverse()
+            _stall_log("\n".join([f"STALL-DUMP thread {name} (ident {ident})"] + stack))
+        except Exception as e:
+            _stall_log(f"STALL-DUMP error dumping thread {name} (ident {ident}): {_describe_error(e)}")
+    del frames
+
+
+def _stalled_loop_report(client, now):
+    """Return ``[(loop name, age seconds, limit seconds, asyncio task or None)]`` for stalled loops.
+
+    Same rule as ``MyClient._loops_stalled`` (a ``None`` heartbeat is never stalled), but says
+    which loop it is and which task runs it, for the dump.
+    """
+    report = []
+    for loop_name, attr, limit in WATCHED_LOOPS:
+        last = getattr(client, attr, None)
+        if last is None or now - last <= limit:
+            continue
+        task = None
+        try:
+            task = getattr(client, loop_name).get_task()
+        except Exception:
+            pass
+        report.append((loop_name, now - last, limit, task))
+    return report
+
+
+def dump_stall_diagnostics(stalled, tasks=None):
+    """Log the stall dump: header, stalled loops' tasks, every other task, then every thread.
+
+    Plain (non-async) so it can't hang on the stalled resource and can run without an event loop.
+
+    @param stalled: output of ``_stalled_loop_report``.
+    @param tasks: snapshot of asyncio tasks to dump; defaults to ``asyncio.all_tasks()`` (which
+        needs a running loop; without one, only the stalled loops' tasks and threads are dumped).
+
+    Example: ``dump_stall_diagnostics(_stalled_loop_report(client, time.monotonic()))``
+    """
+    try:
+        parts = []
+        for loop_name, age, limit, task in stalled:
+            part = f"{loop_name} heartbeat {int(age)}s old (limit {limit}s)"
+            if task is None or task.done():
+                part += ", no running task"
+            parts.append(part)
+        _stall_log("STALL-DUMP header: background loop stalled past its limit; dumping diagnostics "
+                   "before restart: " + "; ".join(parts))
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error building header: {_describe_error(e)}")
+
+    if tasks is None:
+        try:
+            tasks = asyncio.all_tasks()
+        except Exception as e:
+            _stall_log(f"STALL-DUMP error listing asyncio tasks: {_describe_error(e)}")
+            tasks = ()
+    try:
+        tasks = list(tasks)
+    except Exception as e:
+        _stall_log(f"STALL-DUMP error listing asyncio tasks: {_describe_error(e)}")
+        tasks = []
+
+    dumped = set()
+    for loop_name, _age, _limit, task in stalled:
+        if task is None or id(task) in dumped:
+            continue
+        dumped.add(id(task))
+        _dump_task(task, stalled_loop=loop_name)
+
+    others = [t for t in tasks if id(t) not in dumped]
+    try:
+        others.sort(key=_task_name)
+    except Exception:
+        pass
+    for task in others:
+        _dump_task(task)
+
+    _dump_threads()
+
+
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -308,18 +532,20 @@ class MyClient(discord.Client):
         non-cancellable block or a fully-stopped loop, which leave the heartbeat stale. The body is
         deliberately trivial (no Discord/DB awaits) so the watchdog itself can't hang; the event
         loop stays alive during these stalls (the gateway keeps resuming), so it fires reliably.
+        Before exiting it logs the stall dump (see ``dump_stall_diagnostics``).
         """
-        if self._loops_stalled(time.monotonic()):
-            logger.critical("Background loop stalled past its limit; dumping task stacks before restart.")
-            # Diagnostic: dump every asyncio task's suspended stack so the log shows the exact
-            # await a stalled loop is frozen on (the per-iteration wait_for couldn't unwind it).
+        now = time.monotonic()
+        if self._loops_stalled(now):
+            # Diagnostic: name the stalled loop(s) and dump every task's full await chain and
+            # every thread's stack, so the log shows exactly where the stalled work is frozen.
+            # Nested so that even a failure while reporting a failure can't block the restart.
             try:
-                for task in asyncio.all_tasks():
-                    buf = io.StringIO()
-                    task.print_stack(file=buf)
-                    logger.critical(f"STALL-DUMP [{task.get_name()}]\n{buf.getvalue()}")
-            except Exception as e:  # never let diagnostics block the restart
-                logger.critical(f"STALL-DUMP failed: {e}")
+                try:
+                    dump_stall_diagnostics(_stalled_loop_report(self, now))
+                except Exception as e:
+                    _stall_log(f"STALL-DUMP error: {_describe_error(e)}")
+            except Exception:
+                pass
             os._exit(1)
 
     def _ensure_schema(self):

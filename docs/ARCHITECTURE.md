@@ -25,6 +25,18 @@ MESBot is two Python processes that share a database:
   heartbeat goes stale past its limit (`CHECK_USER_STATES_STALL_LIMIT` / `DAILY_TASK_STALL_LIMIT`) —
   catching the cases `wait_for` can't (a non-cancellable block or a stopped loop) so role assignment can
   never silently freeze for hours.
+  Before exiting it writes a **stall dump** to `/var/log/discord_app.log` (CRITICAL, every entry prefixed
+  `STALL-DUMP`), in this order:
+  1. A header naming each stalled loop with its heartbeat age and limit.
+  2. The stalled loop's asyncio task (`STALL-DUMP task <name> [STALLED LOOP: <loop>]`,
+     `check_user_states` before `daily_task`).
+  3. Every other task (`STALL-DUMP task <name>`), each as its full await chain down to the innermost
+     suspension point, ending with the type of the future it waits on.
+  4. Every thread's stack (`STALL-DUMP thread <name> (ident <id>)`).
+
+  Use `grep 'STALLED LOOP'` to find the frozen loop. The dump records code locations only (file, line,
+  function, source line), never locals, arguments or reprs. It is synchronous (`dump_stall_diagnostics`
+  in `main.py`), and any failure inside it is logged in one line and never stops the `os._exit(1)`.
 
 ## Deployment
 
