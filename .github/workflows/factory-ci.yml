@@ -1,0 +1,97 @@
+# Factory CI for mesbot at rapid-prototype (ADR 0008). Change-controlled.
+# At Rapid prototype no job is a required check (ADR 0030): every job runs and reports.
+# Every `uses:` is pinned to a full commit SHA with the tag in a comment (S4.3).
+# Checkout keeps no token and runners are a fixed image, so jobs get only what they need (S8).
+# The runner's own Python 3.12 is used, so no setup action is needed.
+# Installs use the hash-locked requirements*.lock files with --require-hashes, so a
+# tampered or swapped package fails the install; scripts/lock_requirements.py regenerates them.
+name: factory-ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Weekly, so a CVE published after a merge is still found (S4.4).
+  schedule:
+    - cron: "0 6 * * 1"
+permissions:
+  contents: read
+jobs:
+  build:                         # rapid-prototype
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements-dev.lock
+      - run: '"$RUNNER_TEMP/venv/bin/python" -m compileall -q -x "(^|/)\.venv/" .'
+  smoke-test:                    # rapid-prototype
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements.lock
+      # Both entry points connect to MySQL at import, so the connect call is
+      # stubbed; this proves the modules load without a database or a bot token.
+      - run: |
+          "$RUNNER_TEMP/venv/bin/python" -c "
+          import unittest.mock, mysql.connector
+          mysql.connector.connect = unittest.mock.MagicMock()
+          import main, server
+          "
+  unit-tests:                    # alpha (runs and reports from rapid-prototype)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements-dev.lock
+      # Coverage (pytest-cov over coverage.py) is reported, not gated, at Rapid prototype.
+      - run: '"$RUNNER_TEMP/venv/bin/python" -m pytest --junitxml=test-results/junit.xml --cov=. --cov-report=term-missing --cov-report=xml:test-results/coverage.xml'
+  dependency-audit:              # S4.4 applies at every level; required check from beta
+    runs-on: ubuntu-24.04
+    # OSV-Scanner was approved by the owner on 2026-11-10 after an S4.1 review
+    # (factory docs/features/F-003-audit-tool-review.md). The binary is pinned to one
+    # release and checked against this SHA-256 before it runs; upgrading it is
+    # a configuration hygiene item.
+    env:
+      OSV_SCANNER_VERSION: v2.7.1
+      OSV_SCANNER_SHA256: fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Any finding fails; an accepted one goes in osv-scanner.toml with a reason
+      # and an expiry, as a Security decision.
+      - run: |
+          curl -fsSL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  osv-scanner" | sha256sum --check --strict
+          chmod +x osv-scanner
+          ./osv-scanner scan source --recursive --no-resolve --no-call-analysis=go .
+  workflow-audit:                # every level (ADR 0020)
+    runs-on: ubuntu-24.04
+    # zizmor audits the repo's own workflows for known GitHub Actions attacks
+    # (script injection, unsafe triggers, leaked credentials, unpinned
+    # actions). The wheel is pinned by hash; upgrading it is a configuration
+    # hygiene item. No config file or ignore comment in the repo applies, so
+    # an accepted finding is a Security decision, not a comment.
+    env:
+      ZIZMOR_REQUIREMENT: "zizmor==1.32.0 --hash=sha256:84a6acb975accc13408786a2bd274b572537ca19c933ebbc13e78f3988562071"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          echo "$ZIZMOR_REQUIREMENT" > "$RUNNER_TEMP/zizmor.txt"
+          "$RUNNER_TEMP/zizmor/bin/pip" install --require-hashes --only-binary :all: --no-deps -r "$RUNNER_TEMP/zizmor.txt"
+      - run: '"$RUNNER_TEMP/zizmor/bin/zizmor" --offline --no-config --no-ignores --min-severity medium --format github .github/'
+  # Alpha and above: secret-scan, static-analysis (Semgrep, ADR 0024) and
+  # acceptance-tests are added when the repo is promoted.
