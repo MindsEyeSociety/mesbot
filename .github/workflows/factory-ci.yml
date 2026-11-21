@@ -3,8 +3,8 @@
 # Every `uses:` is pinned to a full commit SHA with the tag in a comment (S4.3).
 # Checkout keeps no token and runners are a fixed image, so jobs get only what they need (S8).
 # The runner's own Python 3.12 is used, so no setup action is needed.
-# mesbot has no hash-locked requirements file yet, so installs can't use --require-hashes;
-# that gap is in the onboarding assessment.
+# Installs use the hash-locked requirements*.lock files with --require-hashes, so a
+# tampered or swapped package fails the install; scripts/lock_requirements.py regenerates them.
 name: factory-ci
 on:
   pull_request:
@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - run: |
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install -r requirements.txt -r requirements-dev.txt
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements-dev.lock
       - run: '"$RUNNER_TEMP/venv/bin/python" -m compileall -q -x "(^|/)\.venv/" .'
   smoke-test:                    # rapid-prototype
     needs: build
@@ -35,7 +35,7 @@ jobs:
           persist-credentials: false
       - run: |
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install -r requirements.txt
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements.lock
       # Both entry points connect to MySQL at import, so the connect call is
       # stubbed; this proves the modules load without a database or a bot token.
       - run: |
@@ -52,8 +52,9 @@ jobs:
           persist-credentials: false
       - run: |
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install -r requirements.txt -r requirements-dev.txt
-      - run: '"$RUNNER_TEMP/venv/bin/python" -m pytest --junitxml=test-results/junit.xml'
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r requirements-dev.lock
+      # Coverage (pytest-cov over coverage.py) is reported, not gated, at Rapid prototype.
+      - run: '"$RUNNER_TEMP/venv/bin/python" -m pytest --junitxml=test-results/junit.xml --cov=. --cov-report=term-missing --cov-report=xml:test-results/coverage.xml'
   dependency-audit:              # S4.4 applies at every level; required check from beta
     runs-on: ubuntu-24.04
     # OSV-Scanner was approved by the owner on 2026-11-10 after an S4.1 review

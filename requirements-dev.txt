@@ -2,3 +2,4 @@
 #   pip install -r requirements.txt -r requirements-dev.txt
 pytest>=9.0.3
 pytest-asyncio>=0.23
+pytest-cov>=7.1
