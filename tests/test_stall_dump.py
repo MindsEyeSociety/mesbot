@@ -28,6 +28,7 @@ import main
 ROOT = Path(__file__).resolve().parent.parent
 THIS_FILE = Path(__file__).name
 BASE_COMMIT = "94ea9f35f5cd0d50760a1c6330946ecce888af27"
+LOOP_RESILIENCE_BLOB = "fba6ec3543efb229621a6c94dc35bfd24f0427dd"  # tests/test_loop_resilience.py at BASE_COMMIT
 TASK_PREFIX = "STALL-DUMP task "
 
 CUS_LIMIT = main.CHECK_USER_STATES_STALL_LIMIT  # 240
@@ -524,9 +525,11 @@ async def test_ac15_fresh_or_none_heartbeats_do_nothing(env, cus, daily):
 
 
 def test_ac16_existing_loop_resilience_tests_unmodified_and_pass():
-    diff = subprocess.run(["git", "diff", "--quiet", BASE_COMMIT, "--", "tests/test_loop_resilience.py"],
-                          cwd=ROOT, capture_output=True)
-    assert diff.returncode == 0, "tests/test_loop_resilience.py was modified"
+    # The file's blob id at BASE_COMMIT, so the check needs no history (CI clones depth 1);
+    # hash-object applies the repo's line-ending rules, so a Windows checkout hashes the same.
+    blob = subprocess.run(["git", "hash-object", "tests/test_loop_resilience.py"],
+                          cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    assert blob == LOOP_RESILIENCE_BLOB, "tests/test_loop_resilience.py was modified"
     r = subprocess.run([sys.executable, "-m", "pytest", "tests/test_loop_resilience.py", "-q",
                         "-p", "no:cacheprovider"], cwd=ROOT, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
