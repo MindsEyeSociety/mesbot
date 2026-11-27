@@ -1,11 +1,16 @@
 """F-004 acceptance tests for the daily deploy job (AC-2..AC-20, AC-32, AC-33)."""
 import datetime
 import re
+import sys
 
 import pytest
 
 import f004_harness as h
 from f004_harness import layout, sandbox, hold_lock  # noqa: F401  (fixtures)
+
+# Spec FR-3 / A-007: the job locks with POSIX flock on the Linux host, so tests that run
+# the job (all that take `sandbox`) cannot run elsewhere.
+needs_flock = pytest.mark.skipif(sys.platform != "linux", reason="needs flock; runs in CI on Ubuntu")
 
 ALLOWED_SUDO = {
     "-n supervisorctl restart discord_app",
@@ -27,6 +32,7 @@ def idx(events, prefix, start=0):
 
 
 # ------------------------------------------------------------------ AC-2
+@needs_flock
 def test_ac2_lock_held_skips(sandbox, layout):
     sandbox.new_commit("D")
     before = sandbox.head()
@@ -40,6 +46,7 @@ def test_ac2_lock_held_skips(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-3
+@needs_flock
 def test_ac3_rollback_failed_marker_skips(sandbox, layout):
     sandbox.new_commit("D")
     sandbox.write_marker(layout, "a" * 40, "install", "failed")
@@ -54,6 +61,7 @@ def test_ac3_rollback_failed_marker_skips(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-4
+@needs_flock
 def test_ac4_fetch_failure(sandbox, layout):
     before = sandbox.head()
     res = sandbox.run_job(extra={h.script_roles(h.find_job(), h.JOB_REQUIRED)[0]["remote"]:
@@ -66,6 +74,7 @@ def test_ac4_fetch_failure(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-5
+@needs_flock
 def test_ac5_no_new_commit(sandbox, layout):
     res = sandbox.run_job()
     assert res.rc == 0, res.log
@@ -76,6 +85,7 @@ def test_ac5_no_new_commit(sandbox, layout):
 
 # ------------------------------------------------------------------ AC-6
 @pytest.mark.parametrize("result", ["succeeded", "none"])
+@needs_flock
 def test_ac6_failed_commit_not_retried(sandbox, layout, result):
     c = sandbox.new_commit("C")
     sandbox.write_marker(layout, c, "install", result)
@@ -90,6 +100,7 @@ def test_ac6_failed_commit_not_retried(sandbox, layout, result):
 
 
 # ------------------------------------------------------------------ AC-7
+@needs_flock
 def test_ac7_new_commit_after_failed_one_deploys_and_clears_marker(sandbox, layout):
     c = sandbox.new_commit("C")
     sandbox.write_marker(layout, c, "install", "succeeded")
@@ -103,6 +114,7 @@ def test_ac7_new_commit_after_failed_one_deploys_and_clears_marker(sandbox, layo
 
 # ------------------------------------------------------------------ AC-8
 @pytest.mark.parametrize("how", ["modified", "staged"])
+@needs_flock
 def test_ac8_local_changes_fail_precheck(sandbox, layout, how):
     d = sandbox.new_commit("D")
     before = sandbox.head()
@@ -122,6 +134,7 @@ def test_ac8_local_changes_fail_precheck(sandbox, layout, how):
 
 
 # ------------------------------------------------------------------ AC-9
+@needs_flock
 def test_ac9_rewritten_main_fails_precheck(sandbox, layout):
     x = sandbox.force_rewrite("X")
     before = sandbox.head()
@@ -136,6 +149,7 @@ def test_ac9_rewritten_main_fails_precheck(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-10
+@needs_flock
 def test_ac10_successful_deploy(sandbox, layout):
     d = sandbox.new_commit("D")
     res = sandbox.run_job()
@@ -162,6 +176,7 @@ def test_ac10_successful_deploy(sandbox, layout):
 
 # ------------------------------------------------------------------ AC-11
 @pytest.mark.parametrize("scenario", ["success", "install_fails", "rollback_fails", "no_new_commit"])
+@needs_flock
 def test_ac11_only_three_sudo_commands(sandbox, layout, scenario):
     if scenario != "no_new_commit":
         sandbox.new_commit("D")
@@ -186,6 +201,7 @@ def test_ac11_only_three_sudo_commands(sandbox, layout, scenario):
 
 
 # ------------------------------------------------------------------ AC-12
+@needs_flock
 def test_ac12_health_check_needs_stable_second_check(sandbox, layout):
     d = sandbox.new_commit("D")
     res = sandbox.run_job()
@@ -200,6 +216,7 @@ def test_ac12_health_check_needs_stable_second_check(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-13
+@needs_flock
 def test_ac13_backoff_fails_at_timeout_and_rolls_back(sandbox, layout):
     p = sandbox.head()
     d = sandbox.new_commit("D")
@@ -219,6 +236,7 @@ def test_ac13_backoff_fails_at_timeout_and_rolls_back(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-14
+@needs_flock
 def test_ac14_second_check_failure_does_not_pass(sandbox, layout):
     p = sandbox.head()
     d = sandbox.new_commit("D")
@@ -233,6 +251,7 @@ def test_ac14_second_check_failure_does_not_pass(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-15
+@needs_flock
 def test_ac15_supervisord_down_fails_health_check(sandbox, layout):
     p = sandbox.head()
     d = sandbox.new_commit("D")
@@ -247,6 +266,7 @@ def test_ac15_supervisord_down_fails_health_check(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-16
+@needs_flock
 def test_ac16_install_failure_rolls_back(sandbox, layout):
     p = sandbox.head()
     d = sandbox.new_commit("D")
@@ -271,6 +291,7 @@ def test_ac16_install_failure_rolls_back(sandbox, layout):
 
 # ------------------------------------------------------------------ AC-17
 @pytest.mark.parametrize("step", ["restart", "healthcheck"])
+@needs_flock
 def test_ac17_restart_and_healthcheck_failures_roll_back(sandbox, layout, step):
     p = sandbox.head()
     d = sandbox.new_commit("D")
@@ -292,6 +313,7 @@ def test_ac17_restart_and_healthcheck_failures_roll_back(sandbox, layout, step):
 
 
 # ------------------------------------------------------------------ AC-18
+@needs_flock
 def test_ac18_rollback_reinstall_failure_stops(sandbox, layout):
     d = sandbox.new_commit("D")
     sandbox.set_status_mode("D", "discord_backoff")
@@ -311,6 +333,7 @@ def test_ac18_rollback_reinstall_failure_stops(sandbox, layout):
 
 
 # ------------------------------------------------------------------ AC-19
+@needs_flock
 def test_ac19_failed_rollback_blocks_next_run(sandbox, layout):
     d = sandbox.new_commit("D")
     sandbox.set_status_mode("D", "discord_backoff")
@@ -335,6 +358,7 @@ def test_ac19_failed_rollback_blocks_next_run(sandbox, layout):
 
 # ------------------------------------------------------------------ AC-20
 @pytest.mark.parametrize("scenario", ["precheck", "install", "rollback_failed"])
+@needs_flock
 def test_ac20_marker_content_and_no_secrets(sandbox, layout, scenario):
     d = sandbox.new_commit("D")
     if scenario == "precheck":
@@ -391,6 +415,7 @@ INVALID = ["symlink", "directory", "bad_sha", "short_sha", "bad_step", "bad_resu
 
 
 @pytest.mark.parametrize("variant", INVALID)
+@needs_flock
 def test_ac33_invalid_marker_skips_job(sandbox, layout, variant):
     d = sandbox.new_commit("D")
     variants = h.invalid_variants(layout, sandbox.root, d)

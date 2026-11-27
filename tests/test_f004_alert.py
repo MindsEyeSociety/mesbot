@@ -1,9 +1,14 @@
 """F-004 acceptance and contract tests for the root alert script's deploy alerts
 (AC-21..AC-26) and the job -> alert marker interface."""
+import sys
+
 import pytest
 
 import f004_harness as h
 from f004_harness import layout, sandbox  # noqa: F401  (fixtures)
+
+# Spec FR-3 / A-007: running the job needs POSIX flock (Linux host).
+needs_flock = pytest.mark.skipif(sys.platform != "linux", reason="needs flock; runs in CI on Ubuntu")
 
 C = "c" * 40
 E = "e" * 40
@@ -138,6 +143,7 @@ def test_ac26_invalid_marker_alert(alert, layout, variant):
 
 
 # ------------------------------------------------------------------ contract: job -> alert
+@needs_flock
 def test_contract_job_marker_is_read_by_alert(sandbox, layout, tmp_path):
     d = sandbox.new_commit("D")
     (sandbox.checkout / "README.txt").write_text("edited\n")
@@ -152,6 +158,7 @@ def test_contract_job_marker_is_read_by_alert(sandbox, layout, tmp_path):
     assert d[:7] in dep[0]["body"] and "precheck" in dep[0]["body"]
 
 
+@needs_flock
 def test_contract_job_rollback_failed_marker_gives_critical_alert(sandbox, layout, tmp_path):
     d = sandbox.new_commit("D")
     sandbox.fail_install("D")
