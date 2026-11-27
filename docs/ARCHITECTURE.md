@@ -48,8 +48,9 @@ MESBot is two Python processes that share a database:
   (which is also `$HOME`, so untracked dotfiles in `git status` are normal).
 - Managed by **supervisor**: `discord_app` and `flask_app` (`supervisor/*.conf`, logs in
   `/var/log/{discord_app,flask_app}.log`), both with `autorestart=true`.
-- **`deploy.sh`** is the canonical deploy: `git pull origin main` then
-  `sudo supervisorctl restart discord_app flask_app`. Run it on the server after merging a PR to `main`.
+- **`deploy.sh`** is the manual deploy, run as `mesbot`: `git pull --ff-only origin main`, a hash-locked install
+  into `/home/mesbot/.venv`, then `sudo supervisorctl restart discord_app` and `flask_app`. Normal
+  deploys are done by the daily job below; see "Manual `deploy.sh`" for its details.
   - The `mesbot` user is a sudoer but **not passwordless** by default, so `deploy.sh` prompts for the
     sudo password at the restart step. To make it non-interactive, add a sudoers drop-in
     **`/etc/sudoers.d/mesbot-deploy`** (filename must have no `.`/extension or it is ignored), edited via
@@ -62,6 +63,103 @@ MESBot is two Python processes that share a database:
     Scoped to exactly the commands `deploy.sh` runs; update it if those commands change. Verify with
     `sudo -n supervisorctl status`.
   - Config (`.env`, `TOKEN`, `DB_*`) lives at `/home/mesbot/.env`.
+
+### Automatic daily deploy (F-004)
+
+A daily job deploys the newest `main` commit without the owner. The server **pulls**: nothing
+outside connects to it, and no server credential is stored on GitHub. The job does **not** check
+CI itself; the CI gate is `main`'s branch protection requiring the factory-ci checks, which comes
+with raising mesbot to **beta**. Until then the cron file must not be installed, or a commit that
+failed CI could go live.
+
+- **Job:** `scripts/mesbot_deploy.py`, run as `mesbot` (never root) by the cron file
+  `scripts/mesbot-deploy.cron` at **17:45 UTC** (`45 17 * * *`), 15 minutes before root's 18:00 UTC
+  restart, which stays in root's crontab, unchanged. The cron line assumes the host clock is UTC.
+  Output is appended to `/var/lib/mesbot-deploy/deploy.log`, one line per run.
+- **What a run does:** takes the deploy lock (skips if held); skips if the marker says the rollback
+  failed or the marker is invalid; fetches `main` anonymously over HTTPS (on failure: changes
+  nothing, no marker, no alert, tries again tomorrow); skips if there is no new commit or `main`
+  still points at the commit the marker says failed; fails the **precheck** (marker, no change) if
+  `HEAD` cannot be read, the checkout has tracked local changes, cannot be fast-forwarded or git
+  refuses the fast-forward, or no marker could be written to the state directory (then no marker
+  is written either, and the log line is `failed: precheck: state directory not writable`; the job
+  checks this so that a later failure always leaves one). Otherwise it fast-forwards
+  `/home/mesbot`, runs `/home/mesbot/.venv/bin/python -m pip install --require-hashes -r
+  requirements.lock`, restarts `discord_app` then `flask_app` with `sudo -n supervisorctl`, and runs
+  the health check. The only sudo commands are the three in the drop-in above.
+- **Health check:** `sudo -n supervisorctl status` every 10 s for up to 120 s. It passes when both
+  programs are RUNNING and still RUNNING on a check at least 30 s later.
+- **Rollback:** if the install, a restart or the health check fails, the job resets the checkout to
+  the previous commit, reinstalls that commit's `requirements.lock` with `--require-hashes`,
+  restarts both programs and re-runs the health check. If any rollback step fails it stops there.
+- **Log lines:** `deployed <sha>`, `skipped: another deploy is running`, `skipped: rollback-failed
+  marker present`, `skipped: invalid marker`, `skipped: no new commit`, `skipped: failed commit not
+  retried`, `failed: fetch`, `failed: precheck` (or `failed: precheck: state directory not
+  writable`, with no marker), `failed: <step>; rolled back to <sha>`,
+  `failed: <step>; rollback failed`. Outside the spec's cases it can also log `failed: the deploy job
+  takes no arguments`, `failed: refusing to run as root`, `failed: no flock support on this
+  platform`, `failed: cannot open the deploy lock` or, as a last resort, `failed: unexpected error`.
+  Exit status is 0 for a deploy or a skip, 1 for a failure.
+- **State directory `/var/lib/mesbot-deploy/`** (owner `mesbot`, mode 0750):
+  - `deploy.lock`: exclusive `flock` lock shared by the job and `deploy.sh`, so only one deploy runs.
+  - `deploy.log`: the cron output.
+  - `marker`: written atomically by the job after a failed deploy, read by the root alert script.
+    Exactly four `key=value` lines, nothing else:
+
+    ```text
+    commit=<full 40-character lowercase SHA tried>
+    step=precheck|install|restart|healthcheck
+    rollback=succeeded|failed|none
+    timestamp=YYYY-MM-DDTHH:MM:SSZ
+    ```
+
+    It never holds tokens, `.env` values or members' data. A marker that is a symlink, not a
+    regular file, or not exactly in this format is **invalid**.
+- **Marker effects:** `rollback=succeeded` or `none`: that commit is not retried, but the next new
+  commit on `main` deploys and a successful deploy deletes the marker. `rollback=failed`, or an
+  invalid marker: the job deploys nothing, whatever `main` points at, until the owner deletes it.
+- **Alerts:** the root alert script `scripts/mesbot-supervisor-alert.sh` (5-minute cron) also reads
+  the marker and publishes to the same SNS topic: one `[mesbot] <host> deploy failed` per failed
+  commit; one critical `[mesbot] <host> deploy and rollback failed, manual action needed`; one
+  `[mesbot] <host> deploy marker invalid` (with none of the file's content); and one
+  `[mesbot] <host> deploy recovered` once an alerted marker is gone. A failed fetch sends no alert.
+  It treats the marker as untrusted (it never sources or executes it and never follows a symlink),
+  and keeps its deploy de-duplication in `/var/lib/mesbot-supervisor-alert/deploy-state`, apart from
+  its supervisor `state` file. An invalid marker's de-duplication signature is its `lstat` data plus
+  a hash of its content (never published), so a different invalid marker alerts again. `--dry-run` covers the deploy alerts; `MSA_DEPLOY_MARKER` overrides
+  the marker path for tests.
+- **Recovering:** read `deploy.log` and the marker, fix the cause (for a rollback failure, get both
+  programs RUNNING on a known-good commit by hand), then delete the marker as `mesbot`:
+  `rm /var/lib/mesbot-deploy/marker`. The next 17:45 run deploys `main` again.
+- **Overrides for tests:** `MESBOT_DEPLOY_REPO_DIR`, `MESBOT_DEPLOY_REMOTE_URL`,
+  `MESBOT_DEPLOY_VENV_PYTHON`, `MESBOT_DEPLOY_STATE_DIR`, `MESBOT_DEPLOY_SUPERVISORCTL`,
+  `MESBOT_DEPLOY_POLL_SECS`, `MESBOT_DEPLOY_TIMEOUT_SECS`, `MESBOT_DEPLOY_STABLE_SECS` (see the
+  script header). Defaults: `/home/mesbot`, the public HTTPS repo, `/home/mesbot/.venv/bin/python`,
+  `/var/lib/mesbot-deploy`, `sudo -n supervisorctl`, 10 s / 120 s / 30 s.
+
+**Manual `deploy.sh`** is run as `mesbot` (the venv belongs to `mesbot`). It takes the same deploy
+lock and refuses to run if it is held. It also refuses if the checkout has tracked local changes,
+so the reset below can never discard edits made on the server. It pulls `main` fast-forward only
+(a diverged checkout fails before anything changes), and installs `requirements.lock` with
+`--require-hashes` into `/home/mesbot/.venv`. If the install fails it resets the checkout to the
+commit it started at, does not restart, and exits non-zero (packages already changed in the venv
+are not restored). Otherwise it restarts both programs and prints the status. It ignores the marker
+and has no health check, so after a manual fix the owner still deletes any marker by hand. It
+honours `MESBOT_DEPLOY_REPO_DIR`, `MESBOT_DEPLOY_VENV_PYTHON`, `MESBOT_DEPLOY_STATE_DIR` and
+`MESBOT_DEPLOY_SUPERVISORCTL` (default `sudo supervisorctl`) for tests, and refuses to run as root.
+
+**One-time setup by the owner** (nothing in the repo changes system configuration on its own):
+
+1. As `mesbot`, create the venv with Python 3.12 and install the lock file into it:
+   `python3.12 -m venv /home/mesbot/.venv` then
+   `/home/mesbot/.venv/bin/python -m pip install --require-hashes -r /home/mesbot/requirements.lock`.
+2. Install the updated `supervisor/mesbot.conf` and `supervisor/flask.conf` (both now run
+   `/home/mesbot/.venv/bin/python -u`) into supervisor's config directory, then
+   `sudo supervisorctl reread && sudo supervisorctl update`.
+3. Install the updated `scripts/mesbot-supervisor-alert.sh` to `/usr/local/sbin/` (root-owned).
+4. Create the state directory: `sudo install -d -o mesbot -g mesbot -m 0750 /var/lib/mesbot-deploy`.
+5. **Only after mesbot is beta and `main` requires the factory-ci checks:** install
+   `scripts/mesbot-deploy.cron` as `/etc/cron.d/mesbot-deploy`, root-owned, mode 0644, no execute bit.
 
 ## Data model
 
