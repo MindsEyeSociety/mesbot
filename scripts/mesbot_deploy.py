@@ -15,7 +15,8 @@ One run, in order:
   4. skip if there is no new commit, or `main` still points at the commit a marker says failed;
   5. precheck: an unreadable HEAD, tracked local changes, a non-fast-forward, a fast-forward
      that git refuses, or a state directory where no marker could be written all fail before
-     anything changes (a marker is written when the directory allows it);
+     anything changes (a marker is written when the directory allows it; otherwise the log line
+     is "failed: precheck: state directory not writable");
   6. fast-forward, `pip install --require-hashes -r requirements.lock` into the venv, restart
      discord_app then flask_app, health check. On failure roll back to the previous commit and
      its lock file, restart, re-check, and record the outcome in the marker.
@@ -269,33 +270,33 @@ def git_env():
     return env
 
 
-def git(cfg, *args, timeout=GIT_TIMEOUT_SECS):
-    return ["git", "-c", "credential.helper=", "-C", cfg.repo_dir, *args], timeout
-
-
-def git_ok(cfg, *args):
-    argv, timeout = git(cfg, *args)
-    return run(argv, timeout=timeout, env=git_env())
-
-
-def git_output(cfg, *args):
-    argv, timeout = git(cfg, *args)
+def run_git(cfg, *args, capture=False):
+    """Run git in the checkout. Returns its stripped stdout (capture) or True, or None/False
+    when it fails. Only captured output is kept; everything else is discarded."""
     try:
         result = subprocess.run(
-            argv,
+            ["git", "-c", "credential.helper=", "-C", cfg.repo_dir, *args],
             env=git_env(),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
+            timeout=GIT_TIMEOUT_SECS,
             check=False,
             text=True,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None if capture else False
     if result.returncode != 0:
-        return None
-    return result.stdout.strip()
+        return None if capture else False
+    return result.stdout.strip() if capture else True
+
+
+def git_ok(cfg, *args):
+    return run_git(cfg, *args)
+
+
+def git_output(cfg, *args):
+    return run_git(cfg, *args, capture=True)
 
 
 def head_sha(cfg):
@@ -436,8 +437,9 @@ def deploy(cfg):
         return precheck_failed(cfg, target)
     if not state_dir_writable(cfg):
         # Without a writable state directory a later failure could leave no marker, and so no
-        # alert, so refuse before anything changes. No marker can be written here either.
-        log("failed: precheck")
+        # alert, so refuse before anything changes. No marker can be written here either, so
+        # the log text says why, to tell it apart from a precheck failure that left a marker.
+        log("failed: precheck: state directory not writable")
         return EXIT_FAILED
 
     failed_step = None

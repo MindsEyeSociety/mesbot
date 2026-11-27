@@ -82,8 +82,8 @@ failed CI could go live.
   still points at the commit the marker says failed; fails the **precheck** (marker, no change) if
   `HEAD` cannot be read, the checkout has tracked local changes, cannot be fast-forwarded or git
   refuses the fast-forward, or no marker could be written to the state directory (then no marker
-  is written either; the job checks this so that a later failure always leaves one). Otherwise it
-  fast-forwards
+  is written either, and the log line is `failed: precheck: state directory not writable`; the job
+  checks this so that a later failure always leaves one). Otherwise it fast-forwards
   `/home/mesbot`, runs `/home/mesbot/.venv/bin/python -m pip install --require-hashes -r
   requirements.lock`, restarts `discord_app` then `flask_app` with `sudo -n supervisorctl`, and runs
   the health check. The only sudo commands are the three in the drop-in above.
@@ -94,7 +94,8 @@ failed CI could go live.
   restarts both programs and re-runs the health check. If any rollback step fails it stops there.
 - **Log lines:** `deployed <sha>`, `skipped: another deploy is running`, `skipped: rollback-failed
   marker present`, `skipped: invalid marker`, `skipped: no new commit`, `skipped: failed commit not
-  retried`, `failed: fetch`, `failed: precheck`, `failed: <step>; rolled back to <sha>`,
+  retried`, `failed: fetch`, `failed: precheck` (or `failed: precheck: state directory not
+  writable`, with no marker), `failed: <step>; rolled back to <sha>`,
   `failed: <step>; rollback failed`. Outside the spec's cases it can also log `failed: the deploy job
   takes no arguments`, `failed: refusing to run as root`, `failed: no flock support on this
   platform`, `failed: cannot open the deploy lock` or, as a last resort, `failed: unexpected error`.
@@ -137,8 +138,9 @@ failed CI could go live.
   `/var/lib/mesbot-deploy`, `sudo -n supervisorctl`, 10 s / 120 s / 30 s.
 
 **Manual `deploy.sh`** is run as `mesbot` (the venv belongs to `mesbot`). It takes the same deploy
-lock and refuses to run if it is held, pulls `main` fast-forward only (a diverged checkout fails
-before anything changes), and installs `requirements.lock` with
+lock and refuses to run if it is held. It also refuses if the checkout has tracked local changes,
+so the reset below can never discard edits made on the server. It pulls `main` fast-forward only
+(a diverged checkout fails before anything changes), and installs `requirements.lock` with
 `--require-hashes` into `/home/mesbot/.venv`. If the install fails it resets the checkout to the
 commit it started at, does not restart, and exits non-zero (packages already changed in the venv
 are not restored). Otherwise it restarts both programs and prints the status. It ignores the marker

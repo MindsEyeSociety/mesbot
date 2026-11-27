@@ -3,7 +3,8 @@
 # supervisord programs. Run it on the server as `mesbot` (the venv belongs to mesbot).
 # Normal deploys are done by the daily job, scripts/mesbot_deploy.py (F-004).
 #
-# It takes the same deploy lock as the daily job, so the two never run at once. If the install
+# It takes the same deploy lock as the daily job, so the two never run at once. It refuses a
+# checkout with tracked local changes, so the reset below cannot discard them. If the install
 # fails it resets the checkout to the commit it started at and does not restart, so the running
 # programs keep the old code (packages already changed in the venv are not restored).
 # It neither reads nor writes the daily job's marker and has no health check: after a manual
@@ -42,6 +43,13 @@ fi
 
 cd "$REPO_DIR"
 PREVIOUS="$(git rev-parse --verify 'HEAD^{commit}')"
+
+# The reset after a failed install would silently discard edits made on the server, so refuse
+# while there are any. A status that cannot be read counts as dirty.
+if ! LOCAL_CHANGES="$(git status --porcelain --untracked-files=no)" || [ -n "$LOCAL_CHANGES" ]; then
+    echo "=== The checkout has tracked local changes; commit or discard them first. Nothing changed ===" >&2
+    exit 1
+fi
 
 echo "=== Pulling latest main ==="
 # Fast-forward only: a diverged checkout fails here, before anything changes, rather than
