@@ -125,7 +125,7 @@ deploy_marker_check() {
     local tmp size nul_free line key value n=0
     # Byte-wise matching, so a locale cannot widen the character ranges below.
     local LC_ALL=C
-    m_commit=""; m_step=""; m_rollback=""; m_timestamp=""
+    m_commit=""; m_step=""; m_rollback=""; m_timestamp=""; m_digest=""
 
     if [ -L "$DEPLOY_MARKER" ]; then return 2; fi
     if [ ! -e "$DEPLOY_MARKER" ]; then return 1; fi
@@ -146,6 +146,9 @@ deploy_marker_check() {
         if [ ! -e "$DEPLOY_MARKER" ] && [ ! -L "$DEPLOY_MARKER" ]; then return 1; fi
         return 2
     fi
+    # A hash of the private copy tells one invalid marker from the next for de-duplication.
+    # It goes only into the root-owned state file, never into a message.
+    m_digest="$(sha256sum < "$tmp" 2>/dev/null | cut -c1-64)"
     size="$(wc -c < "$tmp")"
     # Command substitution would silently drop NUL bytes, so reject them up front.
     nul_free="$(LC_ALL=C tr -d '\000' < "$tmp" | wc -c)"
@@ -194,7 +197,11 @@ deploy_alerts() {
     fi
 
     if [ "$rc" -eq 2 ]; then
-        sig="invalid"
+        # One alert per invalid marker (FR-26): the signature names this particular file, so a
+        # different invalid marker put in its place alerts again. lstat data (stat without -L)
+        # covers symlinks and non-regular files without following or reading them, and the
+        # content hash covers a regular file rewritten in place within the same second.
+        sig="invalid $(stat -c '%d:%i:%f:%s:%Y' -- "$DEPLOY_MARKER" 2>/dev/null || echo gone) ${m_digest:-none}"
         subject="[mesbot] ${HOST} deploy marker invalid"
         msg="$(printf 'The mesbot deploy marker %s on %s is invalid: a symlink, not a regular file, or not in the expected format. Its content is not included.\n\nThe daily deploy job deploys nothing until the owner inspects and deletes it by hand as mesbot.\n' \
                "$DEPLOY_MARKER" "$HOST")"

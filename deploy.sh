@@ -44,7 +44,12 @@ cd "$REPO_DIR"
 PREVIOUS="$(git rev-parse --verify 'HEAD^{commit}')"
 
 echo "=== Pulling latest main ==="
-git pull origin main
+# Fast-forward only: a diverged checkout fails here, before anything changes, rather than
+# getting a merge commit or a conflict that would then be deployed.
+if ! git pull --ff-only origin main; then
+    echo "=== Pull failed (not a fast-forward, or fetch failed); nothing changed ===" >&2
+    exit 1
+fi
 
 echo "=== Installing requirements.lock ==="
 if ! "$VENV_PYTHON" -m pip install --require-hashes -r requirements.lock; then

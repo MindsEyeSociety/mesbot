@@ -48,7 +48,7 @@ MESBot is two Python processes that share a database:
   (which is also `$HOME`, so untracked dotfiles in `git status` are normal).
 - Managed by **supervisor**: `discord_app` and `flask_app` (`supervisor/*.conf`, logs in
   `/var/log/{discord_app,flask_app}.log`), both with `autorestart=true`.
-- **`deploy.sh`** is the manual deploy, run as `mesbot`: `git pull origin main`, a hash-locked install
+- **`deploy.sh`** is the manual deploy, run as `mesbot`: `git pull --ff-only origin main`, a hash-locked install
   into `/home/mesbot/.venv`, then `sudo supervisorctl restart discord_app` and `flask_app`. Normal
   deploys are done by the daily job below; see "Manual `deploy.sh`" for its details.
   - The `mesbot` user is a sudoer but **not passwordless** by default, so `deploy.sh` prompts for the
@@ -80,7 +80,10 @@ failed CI could go live.
   failed or the marker is invalid; fetches `main` anonymously over HTTPS (on failure: changes
   nothing, no marker, no alert, tries again tomorrow); skips if there is no new commit or `main`
   still points at the commit the marker says failed; fails the **precheck** (marker, no change) if
-  the checkout has tracked local changes or cannot be fast-forwarded. Otherwise it fast-forwards
+  `HEAD` cannot be read, the checkout has tracked local changes, cannot be fast-forwarded or git
+  refuses the fast-forward, or no marker could be written to the state directory (then no marker
+  is written either; the job checks this so that a later failure always leaves one). Otherwise it
+  fast-forwards
   `/home/mesbot`, runs `/home/mesbot/.venv/bin/python -m pip install --require-hashes -r
   requirements.lock`, restarts `discord_app` then `flask_app` with `sudo -n supervisorctl`, and runs
   the health check. The only sudo commands are the three in the drop-in above.
@@ -92,7 +95,10 @@ failed CI could go live.
 - **Log lines:** `deployed <sha>`, `skipped: another deploy is running`, `skipped: rollback-failed
   marker present`, `skipped: invalid marker`, `skipped: no new commit`, `skipped: failed commit not
   retried`, `failed: fetch`, `failed: precheck`, `failed: <step>; rolled back to <sha>`,
-  `failed: <step>; rollback failed`. Exit status is 0 for a deploy or a skip, 1 for a failure.
+  `failed: <step>; rollback failed`. Outside the spec's cases it can also log `failed: the deploy job
+  takes no arguments`, `failed: refusing to run as root`, `failed: no flock support on this
+  platform`, `failed: cannot open the deploy lock` or, as a last resort, `failed: unexpected error`.
+  Exit status is 0 for a deploy or a skip, 1 for a failure.
 - **State directory `/var/lib/mesbot-deploy/`** (owner `mesbot`, mode 0750):
   - `deploy.lock`: exclusive `flock` lock shared by the job and `deploy.sh`, so only one deploy runs.
   - `deploy.log`: the cron output.
@@ -118,7 +124,8 @@ failed CI could go live.
   `[mesbot] <host> deploy recovered` once an alerted marker is gone. A failed fetch sends no alert.
   It treats the marker as untrusted (it never sources or executes it and never follows a symlink),
   and keeps its deploy de-duplication in `/var/lib/mesbot-supervisor-alert/deploy-state`, apart from
-  its supervisor `state` file. `--dry-run` covers the deploy alerts; `MSA_DEPLOY_MARKER` overrides
+  its supervisor `state` file. An invalid marker's de-duplication signature is its `lstat` data plus
+  a hash of its content (never published), so a different invalid marker alerts again. `--dry-run` covers the deploy alerts; `MSA_DEPLOY_MARKER` overrides
   the marker path for tests.
 - **Recovering:** read `deploy.log` and the marker, fix the cause (for a rollback failure, get both
   programs RUNNING on a known-good commit by hand), then delete the marker as `mesbot`:
@@ -130,7 +137,8 @@ failed CI could go live.
   `/var/lib/mesbot-deploy`, `sudo -n supervisorctl`, 10 s / 120 s / 30 s.
 
 **Manual `deploy.sh`** is run as `mesbot` (the venv belongs to `mesbot`). It takes the same deploy
-lock and refuses to run if it is held, pulls `main`, and installs `requirements.lock` with
+lock and refuses to run if it is held, pulls `main` fast-forward only (a diverged checkout fails
+before anything changes), and installs `requirements.lock` with
 `--require-hashes` into `/home/mesbot/.venv`. If the install fails it resets the checkout to the
 commit it started at, does not restart, and exits non-zero (packages already changed in the venv
 are not restored). Otherwise it restarts both programs and prints the status. It ignores the marker

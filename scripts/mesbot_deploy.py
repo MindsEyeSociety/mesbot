@@ -13,7 +13,9 @@ One run, in order:
   2. skip on a "rollback failed" marker or an invalid marker (left for the owner to delete);
   3. fetch `main`; on failure change nothing and wait for tomorrow (no marker, so no page);
   4. skip if there is no new commit, or `main` still points at the commit a marker says failed;
-  5. precheck: tracked local changes or a non-fast-forward fail before anything changes;
+  5. precheck: an unreadable HEAD, tracked local changes, a non-fast-forward, a fast-forward
+     that git refuses, or a state directory where no marker could be written all fail before
+     anything changes (a marker is written when the directory allows it);
   6. fast-forward, `pip install --require-hashes -r requirements.lock` into the venv, restart
      discord_app then flask_app, health check. On failure roll back to the previous commit and
      its lock file, restart, re-check, and record the outcome in the marker.
@@ -420,8 +422,9 @@ def deploy(cfg):
 
     previous = head_sha(cfg)
     if previous is None:
-        log("failed: cannot read HEAD")
-        return EXIT_FAILED
+        # Nothing has changed yet, and without a known previous commit there is nothing to roll
+        # back to, so an unreadable HEAD is a precheck failure.
+        return precheck_failed(cfg, target)
     if target == previous:
         log("skipped: no new commit")
         return EXIT_OK
@@ -430,14 +433,22 @@ def deploy(cfg):
         return EXIT_OK
 
     if has_local_changes(cfg) or not is_ancestor(cfg, previous, target):
-        write_marker(cfg.marker_path, target, "precheck", "none")
+        return precheck_failed(cfg, target)
+    if not state_dir_writable(cfg):
+        # Without a writable state directory a later failure could leave no marker, and so no
+        # alert, so refuse before anything changes. No marker can be written here either.
         log("failed: precheck")
         return EXIT_FAILED
 
     failed_step = None
-    if not git_ok(cfg, "merge", "--ff-only", "--quiet", target) or head_sha(cfg) != target:
-        # The precheck proved a fast-forward is possible, so this is unexpected; the rollback
-        # reset still restores the previous commit.
+    if not git_ok(cfg, "merge", "--ff-only", "--quiet", target):
+        if head_sha(cfg) == previous and not has_local_changes(cfg):
+            # The merge refused and left the checkout as it was: nothing changed, so this is a
+            # precheck failure rather than a deploy step that needs a rollback.
+            return precheck_failed(cfg, target)
+        # FR-17 fixes the step names; a half-applied merge is rolled back like a failed install.
+        failed_step = "install"
+    elif head_sha(cfg) != target:
         failed_step = "install"
     elif not install_lock(cfg):
         failed_step = "install"
@@ -447,7 +458,12 @@ def deploy(cfg):
         failed_step = "healthcheck"
 
     if failed_step is None:
-        remove_marker(cfg.marker_path)
+        try:
+            remove_marker(cfg.marker_path)
+        except OSError:
+            # The new commit is live either way; a marker left behind keeps alerting the owner,
+            # which is the safe side.
+            pass
         log(f"deployed {target}")
         return EXIT_OK
 
@@ -460,13 +476,45 @@ def deploy(cfg):
         and restart_programs(cfg)
         and health_check(cfg)
     )
+    # The checkout has changed, so the outcome line is logged even if the marker write fails:
+    # the log must say what happened to the programs. The state directory was proved writable
+    # before the fast-forward, so a write failure here means a full disk or a changed directory.
     if rolled_back:
-        write_marker(cfg.marker_path, target, failed_step, "succeeded")
+        try_write_marker(cfg, target, failed_step, "succeeded")
         log(f"failed: {failed_step}; rolled back to {previous}")
     else:
-        write_marker(cfg.marker_path, target, failed_step, "failed")
+        try_write_marker(cfg, target, failed_step, "failed")
         log(f"failed: {failed_step}; rollback failed")
     return EXIT_FAILED
+
+
+def precheck_failed(cfg, target):
+    """FR-8: nothing has changed; record the fetched commit with step precheck and exit 1."""
+    try_write_marker(cfg, target, "precheck", "none")
+    log("failed: precheck")
+    return EXIT_FAILED
+
+
+def try_write_marker(cfg, commit, step, rollback):
+    try:
+        write_marker(cfg.marker_path, commit, step, rollback)
+    except OSError:
+        return False
+    return True
+
+
+def state_dir_writable(cfg):
+    """Prove a marker could be written, by creating and removing a temp file next to it."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".probe.", dir=cfg.state_dir)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return True
 
 
 def main(argv=None):
@@ -502,7 +550,9 @@ def main(argv=None):
         try:
             return deploy(cfg)
         except OSError:
-            log("failed: state directory not writable")
+            # Last resort only: deploy() handles the marker and state-directory errors it can
+            # foresee and logs the FR texts for them.
+            log("failed: unexpected error")
             return EXIT_FAILED
     finally:
         os.close(lock_fd)
