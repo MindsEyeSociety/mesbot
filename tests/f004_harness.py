@@ -423,6 +423,11 @@ def layout(tmp_path_factory):
     d = sb.new_commit("D")
     (sb.checkout / "README.txt").write_text("locally edited\n")
     res = sb.run_job()
+    if "no flock support" in res.log:
+        # Spec FR-3 / A-007: the job's lock is a POSIX flock on the Linux host. A platform
+        # without flock cannot run the job at all: an environment limit, not a product failure.
+        pytest.skip("environment: this platform has no flock support, so the deploy job "
+                    "cannot run here (FR-3); run on Linux")
     assert res.rc != 0, f"precheck failure must exit non-zero; got {res.rc}\n{res.log}"
     files = sb.marker_files()
     assert len(files) == 1, f"expected exactly one marker file in state dir, found {files}\n{res.log}"
