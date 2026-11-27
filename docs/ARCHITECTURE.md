@@ -116,6 +116,10 @@ failed CI could go live.
   commit; one critical `[mesbot] <host> deploy and rollback failed, manual action needed`; one
   `[mesbot] <host> deploy marker invalid` (with none of the file's content); and one
   `[mesbot] <host> deploy recovered` once an alerted marker is gone. A failed fetch sends no alert.
+  It treats the marker as untrusted (it never sources or executes it and never follows a symlink),
+  and keeps its deploy de-duplication in `/var/lib/mesbot-supervisor-alert/deploy-state`, apart from
+  its supervisor `state` file. `--dry-run` covers the deploy alerts; `MSA_DEPLOY_MARKER` overrides
+  the marker path for tests.
 - **Recovering:** read `deploy.log` and the marker, fix the cause (for a rollback failure, get both
   programs RUNNING on a known-good commit by hand), then delete the marker as `mesbot`:
   `rm /var/lib/mesbot-deploy/marker`. The next 17:45 run deploys `main` again.
@@ -130,7 +134,9 @@ lock and refuses to run if it is held, pulls `main`, and installs `requirements.
 `--require-hashes` into `/home/mesbot/.venv`. If the install fails it resets the checkout to the
 commit it started at, does not restart, and exits non-zero (packages already changed in the venv
 are not restored). Otherwise it restarts both programs and prints the status. It ignores the marker
-and has no health check, so after a manual fix the owner still deletes any marker by hand.
+and has no health check, so after a manual fix the owner still deletes any marker by hand. It
+honours `MESBOT_DEPLOY_REPO_DIR`, `MESBOT_DEPLOY_VENV_PYTHON`, `MESBOT_DEPLOY_STATE_DIR` and
+`MESBOT_DEPLOY_SUPERVISORCTL` (default `sudo supervisorctl`) for tests, and refuses to run as root.
 
 **One-time setup by the owner** (nothing in the repo changes system configuration on its own):
 

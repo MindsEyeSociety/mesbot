@@ -1,0 +1,8 @@
+# Daily automatic deploy of `main` (F-004), run as mesbot, never root.
+# Install to /etc/cron.d/mesbot-deploy (root-owned, mode 0644, no execute bit).
+# Install it ONLY after mesbot is beta and `main`'s branch protection requires the factory-ci
+# checks: the job does not check CI itself, so before that a commit that failed CI could go live.
+# 17:45 assumes the host clock is UTC, so the deploy lands before root's 18:00 UTC restart.
+# System python3 on purpose: the job uses only the standard library and must still run, and
+# roll back, when the venv is broken.
+45 17 * * * mesbot /usr/bin/python3 /home/mesbot/scripts/mesbot_deploy.py >> /var/lib/mesbot-deploy/deploy.log 2>&1
