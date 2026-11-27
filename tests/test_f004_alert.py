@@ -32,8 +32,11 @@ def test_ac21_deploy_failed_alert_once(alert, result):
     dep = r1.deploy_publishes()
     assert len(dep) == 1, r1.out
     assert dep[0]["subject"] == subj(alert, "deploy failed")
-    assert C[:7] in dep[0]["body"] and "install" in dep[0]["body"]
+    # FR-19: the message gives the commit, step, rollback result and timestamp
+    _, _, _, ts = h.parse_marker(text)
+    assert C in dep[0]["body"] and "install" in dep[0]["body"]
     assert result in dep[0]["body"]
+    assert ts and ts[0] in dep[0]["body"], dep[0]["body"]
     r2 = alert.run()
     assert r2.deploy_publishes() == [], r2.out
 
@@ -53,13 +56,16 @@ def test_ac22_new_marker_new_alert(alert):
 
 # ------------------------------------------------------------------ AC-23
 def test_ac23_rollback_failed_critical_alert(alert):
-    alert.write_marker(C, "healthcheck", "failed")
+    text = alert.write_marker(C, "healthcheck", "failed")
     r1 = alert.run()
     assert r1.rc == 0, r1.out
     assert r1.subjects().count(subj(alert, "deploy and rollback failed, manual action needed")) == 1, r1.out
     assert subj(alert, "deploy failed") not in r1.subjects()
     body = r1.deploy_publishes()[0]["body"]
-    assert C[:7] in body and "healthcheck" in body
+    # FR-20: the message gives the commit, step and timestamp
+    _, _, _, ts = h.parse_marker(text)
+    assert C in body and "healthcheck" in body
+    assert ts and ts[0] in body, body
     assert alert.run().deploy_publishes() == []
 
 

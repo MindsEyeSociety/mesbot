@@ -196,7 +196,7 @@ def test_ac11_only_three_sudo_commands(sandbox, layout, scenario):
         s = line.strip()
         if s.startswith("#") or "sudo" not in s:
             continue
-        assert "sudo -n" in s or "SUDO" in s.upper() and "-n" in s, f"sudo without -n: {s}"
+        assert ("sudo -n" in s) or ("SUDO" in s.upper() and "-n" in s), f"sudo without -n: {s}"
         assert not re.search(r"sudo\s+(-n\s+)?(git|pip|python)", s), s
 
 
