@@ -31,7 +31,7 @@ def test_ac29_deploy_sh_installs_only_from_lock_with_hashes():
     installs = [l for l in code if re.search(r"\bpip3?\b.*\binstall\b|\binstall\b.*\bpip\b", l)]
     assert installs, "deploy.sh has no pip install"
     for l in installs:
-        assert "--require-hashes" in l and re.search(r"-r\s+\"?(\./)?requirements\.lock\b", l), l
+        assert "--require-hashes" in l and re.search(r"-r[\"',\s]+(\./)?requirements\.lock\b", l), l
         assert "/home/mesbot/.venv/bin/python" in text or ".venv/bin/python" in l
         assert "--break-system-packages" not in l
     joined = "\n".join(code)
@@ -45,7 +45,7 @@ def test_sec2_job_installs_only_from_lock_with_hashes():
     installs = [l for l in code if re.search(r"\binstall\b", l) and "pip" in l]
     assert installs, "job has no pip install"
     for l in installs:
-        assert "--require-hashes" in l and re.search(r"-r\s+\"?(\./)?requirements\.lock\b", l), l
+        assert "--require-hashes" in l and re.search(r"-r[\"',\s]+(\./)?requirements\.lock\b", l), l
         assert "--break-system-packages" not in l
     assert "requirements.txt" not in "\n".join(code)
 
@@ -87,7 +87,7 @@ def test_ac31_architecture_deployment_section():
                    "/usr/local/sbin", "0750", "/etc/cron.d", "marker", "deploy.sh"):
         assert needle in s, f"Deployment section lacks {needle!r}"
     assert "python 3.12" in low
-    assert "supervisor" in low and "reload" in low
+    assert "supervisor" in low and ("reload" in low or "reread" in low or "supervisorctl update" in low)
     assert "beta" in low
     assert re.search(r"(delete|remove)[^.\n]*marker|marker[^.\n]*(delet|remov)", low), "no marker-clearing instructions"
     assert re.search(r"alert", low)

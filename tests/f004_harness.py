@@ -85,11 +85,29 @@ _P1 = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?-([^}]*)\}")
 _P2 = re.compile(r"(?:environ\.get|getenv)\(\s*[\"']([A-Za-z_]\w*)[\"']\s*,\s*[\"']([^\"']*)[\"']")
 
 
+_CONST = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*(\"[^\"\n]*\"|'[^'\n]*'|[0-9][0-9._]*)\s*(?:#.*)?$", re.M)
+# Python forms: env.get("NAME") or DEFAULT_X   /   helper(env, "NAME", DEFAULT_X)
+_P3 = re.compile(r"\.get\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']\s*\)\s*or\s+([A-Z][A-Z0-9_]*)\b")
+_P4 = re.compile(r"\(\s*\w+\s*,\s*[\"']([A-Z][A-Z0-9_]*)[\"']\s*,\s*([A-Z][A-Z0-9_]*)\s*\)")
+
+
+def _norm_default(v: str) -> str:
+    v = v.strip().strip("\"'")
+    if re.fullmatch(r"\d+\.0+", v):
+        v = v.split(".")[0]
+    return v
+
+
 def declared_vars(text: str) -> dict:
     out = {}
     for rx in (_P1, _P2):
         for name, default in rx.findall(text):
             out.setdefault(name, default.strip().strip("\"'"))
+    consts = {n: _norm_default(v) for n, v in _CONST.findall(text)}
+    for rx in (_P3, _P4):
+        for name, const in rx.findall(text):
+            if "_" in name and const in consts:
+                out.setdefault(name, consts[const])
     return out
 
 
