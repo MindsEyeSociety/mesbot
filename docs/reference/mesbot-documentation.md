@@ -1,13 +1,12 @@
-# MESBot Documentation (public page copy)
+# MESBot Documentation
 
-> **Source:** <https://www.modernenigmasociety.org/mesbot-documentation/>
-> **Fetched:** 2026-11-27 (page last modified 2026-05-05, per its `article:modified_time`)
+> **Published at:** <https://www.modernenigmasociety.org/mesbot-documentation/>
+> **First copied from the page:** 2026-11-27 (page last modified 2026-05-05, per its `article:modified_time`)
 >
-> This is a reference copy of the public user and admin documentation, kept so
-> the code can be checked against what members and server admins are told.
-> The website is the source of truth for that text: refresh this copy from the
-> page rather than editing it here. Where this copy and the code disagree,
-> record the gap; do not change either side without the owner's decision.
+> This file is the master copy of the public user and admin documentation.
+> Agents keep it current: when a change alters what members or server admins
+> see or do, update this file in the same change. The owner publishes the
+> website page from this file, so the page may lag behind it.
 >
 > The page has no subpages. The comment form at the bottom of the page
 > is left out. Query strings are dropped from links.
