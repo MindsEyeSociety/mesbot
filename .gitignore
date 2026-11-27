@@ -4,5 +4,6 @@ __pycache__/
 *.pyo
 .venv/
 .pytest_cache/
+.hypothesis/
 errors.log
 .factory/
